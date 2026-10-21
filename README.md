@@ -145,6 +145,7 @@ per task):
 - [Inference with Released Checkpoints](#inference-with-released-checkpoints)
 - [Training](#training)
 - [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
+- [Cloud Inference Service (WebSocket)](#cloud-inference-service-websocket)
 - [Acknowledgements](#acknowledgements)
 - [BibTeX](#bibtex)
 
@@ -158,6 +159,9 @@ FastWAM/
 │   └── task/                 # Task-level configs (training task names)
 ├── scripts/
 │   ├── train.py
+│   ├── serve.py              # WebSocket inference service entrypoint
+│   ├── serve_dev.sh          # Minimal dev launcher (foreground, task + hydra passthrough)
+│   ├── serve_deploy.sh       # Deployment launcher (vars, file checks, background, PID/readyz)
 │   ├── train_zero1.sh        # Deepspeed zero1 training entrypoint
 │   ├── preprocess_action_dit_backbone.py  # Preprocess ActionDiT backbone before training
 │   └── precompute_text_embeds.py  # Precompute T5 text embedding cache before training
@@ -417,6 +421,36 @@ Common `task_name` examples:
 libero_uncond_2cam224_1e-4
 robotwin_uncond_3cam_384_1e-4
 ```
+
+## Cloud Inference Service (WebSocket)
+
+Run FastWAM as a long-lived cloud service and let a robot send observations over
+WebSocket (`ws://` / `wss://`) instead of loading the model on the edge:
+
+```bash
+pip install -e '.[serving]'
+python scripts/serve.py \
+  task=mydata_uncond_2cam224_1e-4 \
+  serving.ckpt=/path/to/weights.pt \
+  serving.dataset_stats_path=/path/to/dataset_stats.json
+
+# or use the deployment launcher (validates files, sets GPU, optional background/token)
+CKPT=/path/to/weights.pt DATASET_STATS=/path/to/dataset_stats.json \
+TASK=mydata_uncond_2cam224_1e-4 GPU=0 PORT=8765 \
+  bash scripts/serve_deploy.sh
+
+# minimal dev launcher: `<task>` first, remaining args go to hydra
+CKPT=/path/to/weights.pt DATASET_STATS=/path/to/dataset_stats.json \
+  bash scripts/serve_dev.sh mydata_uncond_2cam224_1e-4 serving.num_inference_steps=8
+
+# reference client
+python examples/ws_client.py --synthetic --prompt "pick up the cube" --repeat 10
+```
+
+Each binary frame is one msgpack map; images are raw JPEG/PNG bytes and the
+response is an action chunk (`[action_horizon, action_dim]`). See
+[docs/serving_ws_api_zh.md](docs/serving_ws_api_zh.md) for the full protocol,
+configuration and deployment guide.
 
 ## Acknowledgements
 

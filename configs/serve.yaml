@@ -1,0 +1,71 @@
+# @package _global_
+
+# WebSocket inference service. Reuses the training/data/model groups:
+#
+#   python scripts/serve.py \
+#     task=mydata_uncond_2cam224_1e-4 \
+#     serving.ckpt=/path/to/weights.pt \
+#     serving.dataset_stats_path=/path/to/dataset_stats.json
+#
+# `task` selects both the data config (camera keys, video_size, action/state
+# dims, normalization) and the model variant. See docs/serving_ws_api_zh.md.
+
+defaults:
+  - train
+  - _self_
+
+# Serving needs the text encoder at request time (training uses a precomputed
+# cache) and must not depend on the pretrained backbone checkpoint.
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+
+serving:
+  device: cuda
+  dtype: bf16
+  ckpt: null                 # required unless dry_run=true
+  dataset_stats_path: null   # required unless dry_run=true
+
+  host: 0.0.0.0
+  port: 8765
+
+  # Inference
+  compile_action_infer: true
+  force_serve_overrides: true
+  text_encoder_device: cuda  # use "cpu" to free ~10GB VRAM
+  num_inference_steps: 10
+  sigma_shift: null
+  action_horizon: null       # null -> data.train.num_frames - 1
+  num_video_frames: null     # null -> derived; used by joint/idm variants
+  action_infer_mode: first_frame
+  invert_action_transforms: false
+  prompt_cache_size: 64
+
+  # Queue / limits
+  max_queue: 16
+  request_timeout_ms: 5000
+  init_timeout_s: 1800
+  max_message_bytes: 16777216
+  max_images: 8
+  max_image_bytes: 4194304
+
+  # Lifecycle
+  warmup: true
+  warmup_runs: 2
+  dry_run: false
+
+  # Auth (unset env var disables auth; trusted networks only)
+  auth_token_env: FASTWAM_SERVICE_TOKEN
+  log_level: INFO
+
+  # In-process TLS; prefer a reverse proxy for production wss://
+  tls_certfile: null
+  tls_keyfile: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
