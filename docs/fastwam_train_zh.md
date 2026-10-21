@@ -661,3 +661,130 @@ RUN_ID=my_exp_001 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8
   all-gather 通信增加；
 - 两个配置都没有 CPU offload。如果 ZeRO-2 仍然 OOM，应调小 `batch_size`
   或开启 gradient checkpointing；当前脚本未暴露 ZeRO-3。
+
+---
+
+## 10. 自动生成配置的默认参数从何而来
+
+`configs/data/autogen_*.yaml` 与 `configs/task/autogen_*.yaml` 是自动生成的。
+其中的值并不是从某个现成配置文件里整体复制出来的，而是来自**三个来源**，
+最后再被命令行参数覆盖：
+
+| 来源 | 内容 | 典型字段 |
+| --- | --- | --- |
+| 数据集探测 | 从 LeRobot 元数据推导出的客观事实 | reader、相机、维度、`video_backend` |
+| 生成器内置常量 | `prepare_custom_training.py` 中的常量与 `Policy` 默认值 | 帧窗口、resize、batch size、epochs |
+| Hydra 基座配置 | 生成器没有写出的字段，组合时从基座继承 | `mixed_precision`、`seed`、模型结构参数 |
+
+最终优先级（从低到高）：
+
+```text
+configs/train.yaml 基座值
+  < configs/{data,model}/<...>.yaml 组配置（被 task 的 defaults override 选中）
+  < autogen task 配置（# @package _global_，覆盖全局键）
+  < train_custom.sh 生成的 --epochs/--batch-size/... 等 Hydra override
+  < --extra
+  < -- 之后的透传参数
+```
+
+### 10.1 数据集探测值（不是默认值，是事实）
+
+`probe_dataset()` / `merge_probes()` 从 `meta/info.json`、`meta/episodes*`、
+`meta/tasks*` 中读出：
+
+| 生成字段 | 来源 |
+| --- | --- |
+| `_target_`（reader 类）、`video_backend` | `codebase_version`：2.x → lerobot reader；3.0 → lerobot3 + `pyav` |
+| `dataset_dirs` | 命令行 `--dataset` 的绝对路径（仓库内写成 `./` 相对路径） |
+| `shape_meta.images[*].key` | `observation.images.<key>` 去掉前缀 |
+| `raw_shape` | `features[*].shape` / `names`，统一转成 CHW |
+| `shape_meta.action/state` 的 key 与维度 | `action`、`observation.state` 或它们的 `action.*` 子特征，维度取 `shape[0]` |
+| `processor.num_output_cameras` / `action_output_dim` / `proprio_output_dim` | 由上面的相机数与维度求和得到 |
+| `num_obs_steps` | 等于 `data.train.num_frames` |
+
+episode 长度只用于校验采样窗口，不会被写进配置。
+
+### 10.2 生成器内置的常量与策略
+
+写死在 `scripts/prepare_custom_training.py`：
+
+| 参数 | 默认值 | 位置 |
+| --- | --- | --- |
+| `model` | `fastwam` | `scripts/prepare_custom_training.py:42` |
+| `num_frames` | `33` | `:46` |
+| `action_video_freq_ratio` | `4` | `:47` |
+| `context_len` | `128` | `:48` |
+| `batch_size` | `2` | `:49` |
+| `num_workers` | `4` | `:50` |
+| `num_epochs` | `1` | `:51` |
+| `learning_rate` | `1e-4` | `:52` |
+| `save_every` | `100` | `:53` |
+| `resize` | `224 × 224` | `Policy` 定义 `:351` |
+| `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:352` 与 `merge_probes()` |
+| `global_sample_stride` | `1` | `:356` |
+| `delta_action_dim_mask` | 全 `false` | `parse_delta_mask()` |
+| `norm_default_mode` | `min/max` | `:360` |
+| `val_set_proportion` | `0.0` | `:361` |
+| `video_size` | 由 `resize` + 拼接方式计算（如 2 相机水平 → `[224, 448]`） | `merge_probes()` |
+| 文本缓存目录 | `./data/text_embeds_cache/autogen_<name>` | `merge_probes()` |
+
+argparse 的默认值定义在 `:1285-1318`；`build_policy()`（`:748`）把这些值装进
+`Policy`；`render_data_yaml()`（`:674`）和 `render_task_yaml()`（`:682`）
+负责写文件。
+
+### 10.3 Hydra 基座配置提供的值
+
+autogen 配置只写它关心的字段，其余字段在 `verify` 和训练时通过 Hydra 组合继承：
+
+| 参数 | 来源 |
+| --- | --- |
+| `mixed_precision: bf16`、`seed: 42`、`max_grad_norm: 1.0`、`eval_num_inference_steps: 10`、`wandb.*` | `configs/train.yaml` |
+| `model_id`、`tokenizer_max_len`、`load_text_encoder`、`action_dit_pretrained_path`、网络层数/维度、scheduler、loss | `configs/model/fastwam.yaml`（或 `--model` 选中的其他 model） |
+
+生成 task 配置显式写出的字段（因此不再继承 `configs/train.yaml` 的同名值）：
+
+```text
+batch_size, num_workers, lr_scheduler_type, learning_rate, num_epochs,
+max_steps, log_every, save_every, eval_every, gradient_accumulation_steps,
+weight_decay, resume
+```
+
+> 有一处差异值得注意：生成器写的 `weight_decay: 1.0e-2`，
+> 而 `configs/train.yaml:31` 的基座默认是 `0.0`。其余超参与基座默认值一致。
+
+### 10.4 如何查看最终生效的值
+
+`--dry-run` 只打印命令，不展开配置。要看合成后的完整配置：
+
+```bash
+# 不训练，只打印 Hydra 合成结果
+python scripts/train.py --cfg job task=autogen_my_ds
+
+# 叠加 override 查看效果
+python scripts/train.py --cfg job task=autogen_my_ds num_epochs=5 batch_size=8
+```
+
+训练启动后，最终配置（插值已解析）还会保存在：
+
+```text
+runs/<task>/<run_id>/config.yaml
+```
+
+对应 `src/fastwam/runtime.py:462-464` 的
+`OmegaConf.to_container(cfg, resolve=True)` + `OmegaConf.save(...)`。
+
+### 10.5 注意事项
+
+- `context_len` 默认 `128` 来自生成器常量，模型侧的 `model.tokenizer_max_len`
+  默认也是 `128`（`configs/model/fastwam.yaml`）。如果用 `--context-len` 改成
+  其他值，建议同时覆盖 `model.tokenizer_max_len`，否则在线文本编码与缓存文件的
+  长度可能不一致：
+
+  ```bash
+  bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
+    --context-len 256 --extra "model.tokenizer_max_len=256"
+  ```
+
+- 生成器常量不会随 `configs/train.yaml` 的修改自动变化。例如改基座的
+  `batch_size` 不会影响 autogen task 配置；需要显式传 `--batch-size`
+  或直接改生成的 task 配置。
