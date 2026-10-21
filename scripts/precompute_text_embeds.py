@@ -111,30 +111,53 @@ def _resolve_context_len(context_lens: set[int]) -> int:
     return next(iter(context_lens))
 
 
-def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
-    prompts: list[str] = []
-    seen = set()
-    total_task_rows = 0
+def _read_task_texts(ds_dir: str) -> list[str]:
+    """Read task strings from LeRobot 2.x (tasks.jsonl) or 3.0 (tasks.parquet)."""
+    ds_path = Path(ds_dir)
+    tasks_jsonl = ds_path / "meta" / "tasks.jsonl"
+    tasks_parquet = ds_path / "meta" / "tasks.parquet"
 
-    for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
-
-        with tasks_path.open("r", encoding="utf-8") as f:
+    if tasks_jsonl.exists():
+        tasks: list[str] = []
+        with tasks_jsonl.open("r", encoding="utf-8") as f:
             for line_idx, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
                 if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+                    raise KeyError(f"Missing `task` field at {tasks_jsonl}:{line_idx}")
+                tasks.append(str(record["task"]))
+        return tasks
+
+    if tasks_parquet.exists():
+        # LeRobot 3.0 stores the task text either in a `task` column or, in the
+        # standard layout, in the DataFrame index (tasks.iloc[idx].name).
+        import pandas as pd
+
+        frame = pd.read_parquet(tasks_parquet)
+        if "task" in frame.columns:
+            return [str(task) for task in frame["task"].tolist()]
+        return [str(task) for task in frame.index.tolist()]
+
+    raise FileNotFoundError(
+        f"Missing tasks file: {tasks_jsonl} (LeRobot 2.x) or {tasks_parquet} (LeRobot 3.0)"
+    )
+
+
+def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
+    prompts: list[str] = []
+    seen = set()
+    total_task_rows = 0
+
+    for ds_dir in dataset_dirs:
+        tasks = _read_task_texts(ds_dir)
+        for task in tasks:
+            prompt = DEFAULT_PROMPT.format(task=task)
+            total_task_rows += 1
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",

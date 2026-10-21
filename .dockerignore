@@ -1,0 +1,30 @@
+# Keep the image lean: large host-side directories are mounted, not baked.
+data/
+checkpoints/
+runs/
+evaluate_results/
+wandb/
+
+# VCS / IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# RoboTwin evaluation environment is heavy and optional (mount it instead).
+third_party/
+
+# Claude / plans
+.claude/
+
+# Docker files themselves
+docker/
