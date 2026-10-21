@@ -449,7 +449,7 @@ python examples/ws_client.py --synthetic --prompt "pick up the cube" --repeat 10
 
 Each binary frame is one msgpack map; images are raw JPEG/PNG bytes and the
 response is an action chunk (`[action_horizon, action_dim]`). See
-[docs/serving_ws_api_zh.md](docs/serving_ws_api_zh.md) for the full protocol,
+[docs/fastwam_infer-serving_ws_api_zh.md](docs/fastwam_infer-serving_ws_api_zh.md) for the full protocol,
 configuration and deployment guide.
 
 ## Acknowledgements

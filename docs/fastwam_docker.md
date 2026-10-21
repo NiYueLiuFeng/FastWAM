@@ -84,7 +84,7 @@ python experiments/robotwin/run_robotwin_manager.py ... MULTIRUN.num_gpus=4
 - **卡型不一致时务必用 `device=`**，`count=4` 可能混入不同型号 / 显存不同的卡。
 - **端口冲突**：容器默认 `--network=host`。多容器并存时注意训练端口（默认 29500）、
   LIBERO manager 端口，以及 WebSocket 推理服务端口（8765，见
-  [serving_ws_api_zh.md](serving_ws_api_zh.md)）。
+  [fastwam_infer-serving_ws_api_zh.md](fastwam_infer-serving_ws_api_zh.md)）。
 - **卡序一致性**：需要避免 CUDA 按算力重排导致卡序与 `nvidia-smi` 不一致时，可加
   `-e CUDA_DEVICE_ORDER=PCI_BUS_ID`（脚本支持通过 `EXTRA_DOCKER_ARGS` 追加）：
 
