@@ -31,6 +31,8 @@ bash scripts/train_custom.sh --task-file /path/to/my_task.yaml --gpus 4
 bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 ```
 
+> 多数据集的完整流程（冲突校验、统一列名/fps、混合配置）见**第 10 节**。
+
 脚本会自动完成：
 
 1. 从 `meta/info.json` 推导 reader 版本、相机名、`action`/`observation.state` 维度；
@@ -172,6 +174,7 @@ data/my_dataset_v30/
 ### 2.2 硬性约束（不满足会直接报错或断言失败）
 
 1. **多个数据目录的 fps 必须一致**（`base_lerobot_dataset.py` 中有显式 assert）。
+   fps 不同时用 `scripts/adapt_dataset_for_training.py --fps` 统一，详见第 10 节。
 2. **时间窗口约束**：默认 `num_frames=33`、`action_video_freq_ratio=4`，
    即每个训练样本取 33 帧观测 → 32 步动作、9 帧视频（每 4 帧取 1 帧）。
    若修改，必须满足：
@@ -465,7 +468,7 @@ python examples/infer_custom.py \
 | 现象 | 原因与解决 |
 | --- | --- |
 | `数据集中找不到 action 特征 'action'` | 数据集把动作列命名为 `actions` 等非标准名，加 `--action-feature actions`（状态列同理用 `--state-feature`） |
-| `All dataset_dirs must have the same fps` | 多个数据目录 fps 不一致，需统一重采样或去掉不一致的目录 |
+| `All dataset_dirs must have the same fps` | 多个数据目录 fps 不一致：先用 `scripts/adapt_dataset_for_training.py --fps` 统一（第 10.3 节），或去掉不一致的目录 |
 | `Action 'default' shape ... mismatch with meta` | `shape_meta.action.raw_shape` 与数据实际维度不符，改成一致 |
 | `Missing text embedding cache: ...` | 未预计算文本嵌入：运行 `scripts/precompute_text_embeds.py`，或改用在线编码（第 5 节方式 B） |
 | `input_image must be resized before infer, expected multiples of 16` | 拼接后的图像尺寸不是 16 的倍数，检查 `video_size` 与各相机 `shape` |
@@ -502,3 +505,213 @@ python examples/infer_custom.py \
   model.action_dit_pretrained_path=null \
   +CUSTOM.task_description="your instruction"
 ```
+
+## 10. 多数据集混合训练（校验 → 适配 → 训练）
+
+本节对应容器 readme 里的「训练脚本-多数据集」。
+
+FastWAM 支持把多个 LeRobot 数据集放进同一个训练任务：读取器用
+`MultiLeRobotDataset` 把各数据集**按帧拼接**（帧数多的数据集被采样到的比例更高），
+所有数据集共用一套归一化统计和一个采样器。因此数据集之间必须满足一组硬性约束，
+不满足时用本节介绍的两个脚本先做校验和适配。
+
+```text
+校验（check_data_merge_train.py）
+  → 有冲突就适配（adapt_dataset_for_training.py）
+  → 重新校验
+  → 生成多数据集配置（prepare_custom_training.py generate）
+  → 预计算文本嵌入（precompute_text_embeds.py）
+  → dry-run → 正式训练
+```
+
+### 10.1 混合训练的前提
+
+| 项目 | 要求 | 不一致时的表现 |
+| --- | --- | --- |
+| `codebase_version` | 一致（2.0 / 2.1 / 3.0 选一种） | 生成配置时报错 |
+| `fps` | 一致 | `[FAIL] fps 不一致` |
+| action 列 | 列名、子特征（`action.<key>`）、维度一致 | `[FAIL] action 列名/维度不一致` |
+| state 列 | 列名、子特征、维度一致 | `[FAIL] state 列名/维度不一致` |
+| 相机集合 | 一致；或显式 `--camera` / `--intersect-cameras` | `[FAIL] 相机集合不一致` |
+| 采样窗口 | `(num_frames-1)*stride+1` ≤ 每个数据集最短的“最长 episode” | 运行期取帧越界 |
+
+可以不同的部分：
+
+- **分辨率**：加载时每个相机各自 resize 到 `--resize`（默认 224×224）后再拼接；
+- **episode 数、任务文本数**：任务文本会合并去重；验证集（`val_proportion`）按数据集各自切分；
+- **数据量**：合并后按帧数加权采样，数据量大的数据集占比更高。
+
+> 归一化统计在合并后的数据集上统一计算一次（写入 `dataset_stats.json`），
+> 不会为每个数据集单独保存。
+
+### 10.2 第一步：前置校验
+
+`scripts/check_data_merge_train.py` 只读元数据、不修改任何文件，判断规则与
+`prepare_custom_training.py generate` 内部的 `merge_probes` 一致，并额外核对
+`meta/info.json` 与实际 parquet 的列是否对得上（防止“只改了 meta 没改数据”）。
+
+```bash
+python scripts/check_data_merge_train.py \
+    --dataset /workspace/data/ds_a \
+    --dataset /workspace/data/ds_b \
+    --action-feature actions
+```
+
+退出码：
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 可以混合训练 |
+| 1 | 存在冲突，逐条列出原因与修复命令 |
+| 2 | 参数或数据集路径错误 |
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--action-feature NAME` | action 列名（默认 `action`），所有数据集共用同一个值 |
+| `--state-feature NAME` | state 列名（默认 `observation.state`） |
+| `--camera KEY` | 只用这些相机（去掉 `observation.images.` 前缀，可重复） |
+| `--intersect-cameras` | 取所有数据集的公共相机（默认要求相机集合完全一致） |
+| `--num-frames` / `--global-sample-stride` / `--action-video-freq-ratio` | 采样窗口检查 |
+
+输出示例：
+
+```text
+== 数据集 2/2: /workspace/data/ds_b
+   version : 3.0  (fastwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset)
+   fps     : 30
+   action  : actions[13]
+   state   : observation.state[13]
+
+== 交叉检查
+   [FAIL] fps 不一致: ds_a=15, ds_b=30
+          -> python scripts/adapt_dataset_for_training.py \
+             --src /workspace/data/ds_b --dst /workspace/data/ds_b_15 --fps 15
+结果: 不可混合训练（1 项 FAIL，0 项 WARN）
+```
+
+> 脚本对所有 `--dataset` 使用同一个 `--action-feature` / `--state-feature`。
+> 如果两个数据集的列名本就不同，按提示统一命名后，后续所有命令都要用新名字。
+
+### 10.3 第二步：适配数据（仅在需要时）
+
+`scripts/adapt_dataset_for_training.py` 把源数据集**完整复制到新目录**并同步改写，
+不修改原数据。支持两种操作，可单独或组合：
+
+- `--rename OLD=NEW`：重命名特征列（例如 `actions` → `action`，可重复）；
+- `--fps N`：按比例抽帧（**只支持降低**），把 fps 统一到较低值。
+
+```bash
+# 只统一 fps：ds_b 30fps -> 15fps
+python scripts/adapt_dataset_for_training.py \
+    --src /workspace/data/ds_b \
+    --dst /workspace/data/ds_b_15 \
+    --fps 15 \
+    --dry-run          # 先打印计划；确认后去掉 --dry-run
+
+# 只统一列名
+python scripts/adapt_dataset_for_training.py \
+    --src /workspace/data/ds_b --dst /workspace/data/ds_b_renamed \
+    --rename actions=action
+
+# 两者同时
+python scripts/adapt_dataset_for_training.py \
+    --src /workspace/data/ds_b --dst /workspace/data/ds_b_15_action \
+    --fps 15 --rename actions=action
+```
+
+同步改写的内容：
+
+| 位置 | 改动 |
+| --- | --- |
+| `meta/info.json` | `features` 键名；`fps`、`total_frames`（`splits` 的 episode 区间不变） |
+| `meta/stats.json` | 键名；按抽帧后的数据重算 `count/min/max/mean/std` |
+| `meta/episodes/*.parquet` | `stats/<feature>/*`、`videos/<feature>/*` 列名；`length`、`dataset_from/to_index` 及可重算的统计量 |
+| `data/*.parquet` | 列名；抽帧后的行，重算 `frame_index` / `index` / `is_first` / `is_last` |
+| `videos/` | 默认相对路径符号链接（不占额外空间）；改视频特征名时同步改目录名 |
+
+实现要点与限制：
+
+- **视频不重新编码**。抽帧保留原始 `timestamp` 列，读取器按时间戳取视频帧；
+  被保留帧的时间戳恰好等于新 fps 下的时间戳，因此画面与动作仍严格对齐。
+- `--copy-videos` 改为真实复制（跨文件系统、或需要独立分发数据集时用），
+  空间占用与原数据相同。
+- 输出目录必须不存在；`--force` 只允许删除**本工具生成过**的目录（有
+  `.adapt_dataset_for_training.json` 标记文件校验）。
+- 只支持降低 fps；提高 fps 需要重编码视频（插值），本工具不做。
+- 目标是同一个挂载目录下的相对路径符号链接，所以 `--dst` 应与 `--src`
+  位于同一挂载树内（例如都放在 `/workspace/data` 下）。
+- 支持 LeRobot 2.0 / 2.1 / 3.0；3.0 要求同一文件内的 episode 连续、
+  `episode_index` 跨文件严格递增（LeRobot 官方导出默认满足）。
+
+### 10.4 第三步：重新校验
+
+```bash
+python scripts/check_data_merge_train.py \
+    --dataset /workspace/data/ds_a \
+    --dataset /workspace/data/ds_b_15 \
+    --action-feature actions
+```
+
+看到 `结果: 可以混合训练` 后再继续。
+
+### 10.5 第四步：生成多数据集配置
+
+```bash
+python scripts/prepare_custom_training.py generate \
+    --dataset /workspace/data/ds_a \
+    --dataset /workspace/data/ds_b_15 \
+    --name mixed_ab \
+    --action-feature actions \
+    --camera front --camera wrist \
+    --num-frames 33 \
+    --resize 224 224 \
+    --concat horizontal \
+    --print-name
+# -> autogen_mixed_ab
+```
+
+说明：
+
+- `--dataset` 可重复；`--name` 决定配置文件名 `autogen_<name>.yaml`，
+  不写时按数据集目录名拼接，建议显式指定；
+- 数据集级的策略（相机、拼接、resize、帧数、归一化方式、验证集比例）
+  对所有数据集统一生效；
+- 生成后配置里 `train.dataset_dirs` 会列出全部数据集。
+
+### 10.6 第五步：文本嵌入与训练
+
+```bash
+# 文本嵌入会遍历配置中所有数据集，合并去重任务文本
+python scripts/precompute_text_embeds.py task=autogen_mixed_ab
+
+# dry-run：检查 backbone、文本缓存并打印最终命令
+bash scripts/train_custom.sh \
+    --dataset /workspace/data/ds_a --dataset /workspace/data/ds_b_15 \
+    --name mixed_ab --action-feature actions \
+    --camera front --camera wrist --gpus 4 \
+    --backbone /workspace/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
+    --dry-run
+
+# 正式训练：与 dry-run 参数完全一致，去掉 --dry-run
+```
+
+> `train_custom.sh` 每次都会按 `--dataset / --camera / --action-feature` 重新生成
+> 配置，所以 dry-run 与正式训练的参数必须一致；参数变了会得到另一份配置
+> （也可能用到另一份文本缓存）。
+
+也可以跳过 `prepare_custom_training.py`，直接用 `train_custom.sh --dataset ...`
+（见“一键启动”），但建议先用第 10.2 节的校验脚本确认数据集之间没有冲突。
+
+### 10.7 常见冲突与处理
+
+| 现象 | 处理 |
+| --- | --- |
+| `[FAIL] fps 不一致` | `adapt_dataset_for_training.py --fps <较低值>` |
+| `[FAIL] action 列名/维度不一致` | 仅列名不同：`--rename actions=action`；维度不同（13 vs 7）无法拼接，需重新导出数据 |
+| `[FAIL] 相机集合不一致` | 加 `--intersect-cameras` 取交集，或 `--camera` 显式选择双方都有的相机 |
+| `[FAIL] codebase_version 不一致` | 重新导出为同一版本（本工具不做版本迁移） |
+| `[FAIL] 数据集 X 的最长 episode 只有 N 帧，小于采样窗口 M 帧` | 减小 `--num-frames` / `--global-sample-stride`，或去掉该数据集 |
+| `--dst 已存在` | 换输出目录；确认是上次产物时加 `--force` |
+| 抽帧后训练收敛变慢 | fps 减半后，同样的 `num_frames=33` 覆盖的时间跨度变成 2 倍；可按需调整 `num_frames` 或 `global_sample_stride` |
