@@ -91,7 +91,16 @@ ENV PATH=/opt/venv/bin:${PATH}
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
     MUJOCO_GL=egl \
     DIFFSYNTH_MODEL_BASE_PATH=/workspace/checkpoints \
-    HF_HOME=/workspace/hf_cache
+    HF_HOME=/workspace/hf_cache \
+    HOME=/workspace/home \
+    XDG_CACHE_HOME=/workspace/home/.cache \
+    TRITON_CACHE_DIR=/workspace/home/.triton \
+    TORCHINDUCTOR_CACHE_DIR=/workspace/home/.torchinductor
+
+# Writable $HOME so the image also works with `docker run --user $(id -u):$(id -g)`:
+# torch inductor/triton, wandb and LIBERO all write under it. Mounting a host
+# directory over this path keeps that directory's own ownership instead.
+RUN mkdir -p /workspace/home && chmod 777 /workspace/home
 
 WORKDIR /workspace/FastWAM
 
@@ -145,8 +154,10 @@ RUN for i in 1 2 3 4 5; do \
   && pip install --no-cache-dir numba scipy pynput opencv-python \
   && pip install --no-cache-dir bddl==1.0.1 future pyparsing matplotlib cloudpickle "gym==0.25.2" \
   && pip install --no-cache-dir mujoco==3.3.2 \
-  && mkdir -p /opt/LIBERO/libero/datasets /root/.libero \
-  && python -c "import yaml; root='/opt/LIBERO/libero/libero'; yaml.dump({'benchmark_root': root, 'bddl_files': root+'/bddl_files', 'init_states': root+'/init_files', 'datasets': '/opt/LIBERO/libero/datasets', 'assets': root+'/assets'}, open('/root/.libero/config.yaml','w'))" \
+  && mkdir -p /opt/LIBERO/libero/datasets /opt/libero-config /root/.libero \
+  && python -c "import yaml; root='/opt/LIBERO/libero/libero'; yaml.dump({'benchmark_root': root, 'bddl_files': root+'/bddl_files', 'init_states': root+'/init_files', 'datasets': '/opt/LIBERO/libero/datasets', 'assets': root+'/assets'}, open('/opt/libero-config/config.yaml','w'))" \
+  && cp /opt/libero-config/config.yaml /root/.libero/config.yaml \
+  && chmod -R a+rX /opt/libero-config \
   && pip check \
   && python -c "import torch, torchvision, fastwam, deepspeed, av, torchcodec; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
   && python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok')" \
@@ -154,6 +165,15 @@ RUN for i in 1 2 3 4 5; do \
 
 # WebSocket inference service port (see docs/serving_ws_api_zh.md).
 EXPOSE 8765
+
+# Seed ~/.libero/config.yaml into whatever $HOME the container starts with, so
+# non-root runs (`--user <uid>:<gid>`) keep LIBERO working. Copied from the
+# build context rather than symlinked into /workspace/FastWAM: that path is
+# usually shadowed by a bind mount at runtime.
+COPY scripts/container_entrypoint.sh /usr/local/bin/fastwam-entrypoint
+RUN chmod 755 /usr/local/bin/fastwam-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/fastwam-entrypoint"]
 
 # Default command: an interactive shell. See docker/run_container.sh for the
 # recommended run invocation (GPU, shm, volume mounts).
