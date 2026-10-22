@@ -46,6 +46,7 @@ RANDOM_BACKBONE=0
 SKIP_PREREQ=0
 DRY_RUN=0
 FORCE=0
+MIN_FREE_GPU_MEM_GB="${MIN_FREE_GPU_MEM_GB:-24}"
 
 usage() {
   cat <<'EOF'
@@ -86,12 +87,15 @@ usage() {
   --random-backbone-init   跳过 backbone 检查并随机初始化（不推荐）
   --online-text-encode     不预计算文本嵌入，训练时在线编码
   --zero {1,2}             DeepSpeed ZeRO stage（默认 1）
-  --skip-prereq-check      只做配置校验，不检查 backbone / 文本缓存
+  --skip-prereq-check      只做配置校验，不检查 backbone / 文本缓存 / 空闲显存
   --dry-run                打印最终训练命令后退出
   --force                  允许覆盖非自动生成的同名配置
   --extra "k=v k=v"        追加 Hydra overrides（可用于覆盖上面的默认值）
   --                       其后的参数原样传给训练脚本
   -h, --help               显示本帮助
+
+环境变量:
+  MIN_FREE_GPU_MEM_GB      启动前要求每张卡的 idle 显存（GiB，默认 24；0 关闭检查）
 EOF
 }
 
@@ -102,6 +106,44 @@ die() {
 
 resolve_path() {
   realpath -m -- "$1"
+}
+
+# Fail fast when the cards are already occupied by someone else. Without this,
+# the run dies minutes later inside an unrelated NCCL collective with
+# "ncclUnhandledCudaError ... Cuda failure 2 'out of memory'".
+check_gpu_memory() {
+  local need_mib=$(( MIN_FREE_GPU_MEM_GB * 1024 ))
+  (( need_mib > 0 )) || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local rows
+  rows="$(nvidia-smi --query-gpu=index,memory.total,memory.free \
+    --format=csv,noheader,nounits 2>/dev/null)" || return 0
+  [[ -n "$rows" ]] || return 0
+
+  local index total free short=0 details=()
+  while IFS=',' read -r index total free; do
+    index="${index// /}"
+    total="${total// /}"
+    free="${free// /}"
+    [[ "$index" =~ ^[0-9]+$ && "$free" =~ ^[0-9]+$ ]] || continue
+    (( index < GPUS )) || continue
+    details+=("  GPU ${index}: 空闲 ${free} MiB / 共 ${total} MiB")
+    if (( free < need_mib )); then
+      short=$((short + 1))
+    fi
+  done <<< "$rows"
+
+  (( ${#details[@]} > 0 )) || return 0
+  (( short == 0 )) && return 0
+
+  {
+    echo "error: 可用显存不足，训练会在启动阶段 OOM（每张卡要求 >= ${MIN_FREE_GPU_MEM_GB} GiB 空闲）："
+    printf '%s\n' "${details[@]}"
+    echo "本次要用 ${GPUS} 张卡，其中 ${short} 张空闲显存不够。用 nvidia-smi 看是哪张卡上还有别的进程。"
+    echo "处理方式：换到空闲卡；等占用显存的任务结束后再跑；确认要强行启动时加 --skip-prereq-check。"
+  } >&2
+  exit 1
 }
 
 detect_gpu_count() {
@@ -278,6 +320,10 @@ fi
 visible="$(detect_gpu_count)"
 if [[ "$visible" != "0" ]] && (( GPUS > visible )); then
   die "--gpus=$GPUS 超过当前可见 GPU 数 ($visible)"
+fi
+
+if (( SKIP_PREREQ == 0 )); then
+  check_gpu_memory
 fi
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
