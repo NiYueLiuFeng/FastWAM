@@ -475,6 +475,7 @@ python examples/infer_custom.py \
 | `num_frames-1 must be divisible by action_video_freq_ratio` | 自定义 `num_frames` / `action_video_freq_ratio` 不满足第 2.2 节的整除约束 |
 | `Concatenated image ... != video_size` | 推理时的相机 resize/拼接方式与训练不一致，对照第 7.2 节步骤 3 |
 | 首次训练很慢才开始 | 正在遍历数据集计算归一化统计（只发生一次），完成后写入 `dataset_stats.json` |
+| 启动几十秒后报 `ncclUnhandledCudaError ... Cuda failure 2 'out of memory'`，落在 `data.train`（`Calculating dataset stats for normalization` 附近） | 卡上已有别的进程占显存，模型/梯度装不下。先 `nvidia-smi` 看空闲显存，换到空卡或等占用任务结束；本仓库的 `train_custom.sh` 会在启动前检查每张卡的空闲显存并直接报错（阈值 `MIN_FREE_GPU_MEM_GB`，默认 24，`--skip-prereq-check` 可跳过检查） |
 | 评测报找不到 `dataset_stats.json` | 显式传 `EVALUATION.dataset_stats_path`，或把该文件放在 checkpoint 同级/上级目录 |
 
 ## 9. 速查：从数据到推理的最小命令序列
