@@ -14,6 +14,19 @@ logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
 
+
+def _resolve_lerobot_key(meta: Dict[str, Any], standard_key: str, default_key: str) -> str:
+    """Map a shape_meta entry to its LeRobot column.
+
+    Standard LeRobot names are derived from `key`; an explicit `lerobot_key`
+    in shape_meta overrides that, which lets datasets name the column
+    differently (e.g. `actions` instead of `action`).
+    """
+    explicit = meta.get("lerobot_key")
+    if explicit:
+        return str(explicit)
+    return standard_key if meta["key"] != "default" else default_key
+
 class BaseLerobotDataset(torch.utils.data.Dataset):
     metadata_cls = LeRobotDatasetMetadata
     multi_dataset_cls = MultiLeRobotDataset
@@ -76,7 +89,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         delta_timestamps = {}
         for meta in self.image_meta:
             key = meta["key"]
-            meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
+            meta["lerobot_key"] = _resolve_lerobot_key(
+                meta, f"observation.images.{key}", "observation.images")
             image_stride = self.image_subsample_stride if self.presample_images else 1
             delta_timestamps[meta["lerobot_key"]] = [
                 (t * global_sample_stride) / fps
@@ -85,14 +99,16 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         
         for meta in self.state_meta:
             key = meta["key"]
-            meta["lerobot_key"] = f"observation.state.{key}" if key != "default" else "observation.state"
+            meta["lerobot_key"] = _resolve_lerobot_key(
+                meta, f"observation.state.{key}", "observation.state")
             delta_timestamps[meta["lerobot_key"]] = [
                 (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
         
         for meta in self.action_meta:
             key = meta["key"]
-            meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
+            meta["lerobot_key"] = _resolve_lerobot_key(
+                meta, f"action.{key}", "action")
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}

@@ -125,6 +125,21 @@ FastWAM 通过 `shape_meta` 中的 key 映射到 LeRobot 列名：
 即数据需符合 LeRobot 标准命名（`observation.images.<相机名>`、`observation.state`、`action`），
 且每帧任务文本通过 `meta/tasks.jsonl` / parquet 中的 `task` 列提供。
 
+若动作/状态列不是标准命名（例如动作列叫 `actions`），无需改动数据集，
+生成配置时显式指定列名即可：
+
+```bash
+bash scripts/train_custom.sh --dataset ./data/my_dataset_v30 \
+  --action-feature actions --state-feature observation.state --gpus 4
+# 或直接调用生成器：
+python scripts/prepare_custom_training.py generate --dataset ./data/my_dataset_v30 \
+  --action-feature actions --print-name
+```
+
+生成的 data config 会在对应条目下写入 `lerobot_key: actions`，
+读取器（`base_lerobot_dataset.py`）优先使用该字段，未写入时仍按上表推导。
+相机列目前只支持 `observation.images.<相机名>`。
+
 ### 2.1 目录结构
 
 **LeRobot 2.1**（`_target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset`）：
@@ -449,6 +464,7 @@ python examples/infer_custom.py \
 
 | 现象 | 原因与解决 |
 | --- | --- |
+| `数据集中找不到 action 特征 'action'` | 数据集把动作列命名为 `actions` 等非标准名，加 `--action-feature actions`（状态列同理用 `--state-feature`） |
 | `All dataset_dirs must have the same fps` | 多个数据目录 fps 不一致，需统一重采样或去掉不一致的目录 |
 | `Action 'default' shape ... mismatch with meta` | `shape_meta.action.raw_shape` 与数据实际维度不符，改成一致 |
 | `Missing text embedding cache: ...` | 未预计算文本嵌入：运行 `scripts/precompute_text_embeds.py`，或改用在线编码（第 5 节方式 B） |

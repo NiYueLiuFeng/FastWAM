@@ -66,6 +66,8 @@ usage() {
   --num-frames N           默认 33
   --action-video-freq-ratio N  默认 4
   --global-sample-stride N     默认 1
+  --action-feature NAME    action 列名（默认 action；数据用 actions 等非标准命名时指定）
+  --state-feature NAME     state 列名（默认 observation.state）
   --action-key KEY         action.<key> 子特征（可重复）
   --state-key KEY          observation.state.<key> 子特征（可重复）
   --delta-mask SPEC        true/false 逗号列表，或 all-false / all-true
@@ -226,7 +228,7 @@ while [[ $# -gt 0 ]]; do
       GEN_EXTRA+=("$1" "$2")
       shift 2
       ;;
-    --action-key|--state-key)
+    --action-feature|--state-feature|--action-key|--state-key)
       need_value "$@"
       GEN_EXTRA+=("$1" "$2")
       shift 2

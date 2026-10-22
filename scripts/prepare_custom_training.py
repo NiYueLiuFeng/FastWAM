@@ -127,8 +127,9 @@ def _bool_list(values: Sequence[bool]) -> str:
 
 @dataclass
 class VectorSpec:
-    key: str
+    key: str  # shape_meta key: "default" or the `base.suffix` part
     dim: int
+    lerobot_key: str  # actual LeRobot feature/column name
 
 
 @dataclass
@@ -204,19 +205,44 @@ def parse_camera_shape(feature: dict[str, Any], key: str) -> tuple[int, int, int
     return channels, height, width
 
 
-def parse_vector_specs(features: dict[str, Any], base_key: str, label: str) -> list[VectorSpec]:
-    """Find `action` / `observation.state` or their `base.suffix` variants."""
+def _vector_feature_names(features: dict[str, Any]) -> list[str]:
+    """Feature names whose shape is 1-D, i.e. usable as action/state vectors."""
+    names = []
+    for key, feature in features.items():
+        shape = feature.get("shape")
+        if shape is not None and len(shape) == 1:
+            names.append(key)
+    return sorted(names)
+
+
+def parse_vector_specs(
+    features: dict[str, Any],
+    base_key: str,
+    label: str,
+    flag: str,
+) -> list[VectorSpec]:
+    """Find `base_key` or its `base_key.suffix` variants.
+
+    `base_key` is the LeRobot feature name; it defaults to the standard
+    `action` / `observation.state` but can be any column (e.g. `actions`) when
+    the dataset does not follow the LeRobot convention.
+    """
     if base_key in features:
         feature = features[base_key]
-        return [VectorSpec("default", _vector_dim(feature, base_key))]
+        return [VectorSpec("default", _vector_dim(feature, base_key), base_key)]
 
     prefix = base_key + "."
     specs: list[VectorSpec] = []
     for key, feature in features.items():
         if key.startswith(prefix):
-            specs.append(VectorSpec(key[len(prefix):], _vector_dim(feature, key)))
+            specs.append(VectorSpec(key[len(prefix):], _vector_dim(feature, key), key))
     if not specs:
-        die(f"数据集中找不到 {label} 特征 {base_key!r}")
+        candidates = _vector_feature_names(features)
+        die(
+            f"数据集中找不到 {label} 特征 {base_key!r}。"
+            f"若数据集没有采用标准命名，请用 {flag} 指定列名；"
+            f"当前 1 维特征: {candidates}"
+        )
     return specs
 
 
@@ -294,7 +320,11 @@ def read_task_texts(path: Path) -> list[str]:
     raise AssertionError("unreachable")
 
 
-def probe_dataset(path: Path) -> Probe:
+def probe_dataset(
+    path: Path,
+    action_feature: str = "action",
+    state_feature: str = "observation.state",
+) -> Probe:
     info_path = path / "meta" / "info.json"
     if not info_path.exists():
         die(f"不是 LeRobot 数据集（缺少 {info_path}）")
@@ -320,8 +350,8 @@ def probe_dataset(path: Path) -> Probe:
     if not cameras:
         die(f"{path} 中没有任何 RGB 相机（observation.images.*）")
 
-    action = parse_vector_specs(features, "action", "action")
-    state = parse_vector_specs(features, "observation.state", "observation.state")
+    action = parse_vector_specs(features, action_feature, "action", "--action-feature")
+    state = parse_vector_specs(features, state_feature, "state", "--state-feature")
     lengths = read_episode_lengths(path, version)
 
     return Probe(
@@ -354,6 +384,8 @@ class Policy:
     num_frames: int = DEFAULT_NUM_FRAMES
     action_video_freq_ratio: int = DEFAULT_FREQ_RATIO
     global_sample_stride: int = 1
+    action_feature: str = "action"
+    state_feature: str = "observation.state"
     action_keys: list[str] = field(default_factory=list)
     state_keys: list[str] = field(default_factory=list)
     delta_mask: str | None = None
@@ -600,6 +632,13 @@ def _render_transforms(resize: tuple[int, int], indent: str) -> list[str]:
     ]
 
 
+def _default_lerobot_key(name: str, key: str) -> str:
+    """The column the reader derives when shape_meta has no explicit lerobot_key."""
+    if name == "action":
+        return f"action.{key}" if key != "default" else "action"
+    return f"observation.state.{key}" if key != "default" else "observation.state"
+
+
 def _render_data_node(plan: Plan, node: str, is_val: bool) -> list[str]:
     policy = plan.policy
     resize = policy.resize
@@ -620,6 +659,10 @@ def _render_data_node(plan: Plan, node: str, is_val: bool) -> list[str]:
             lines.append(f"      - key: {spec.key}")
             lines.append(f"        raw_shape: {spec.dim}")
             lines.append(f"        shape: {spec.dim}")
+            # Only written when the dataset uses a non-standard column name,
+            # keeping configs for standard LeRobot datasets unchanged.
+            if spec.lerobot_key != _default_lerobot_key(name, spec.key):
+                lines.append(f"        lerobot_key: {spec.lerobot_key}")
     lines.extend([
         f"  num_frames: {policy.num_frames}",
         f"  global_sample_stride: {policy.global_sample_stride}",
@@ -758,6 +801,8 @@ def build_policy(args: argparse.Namespace) -> Policy:
         num_frames=args.num_frames,
         action_video_freq_ratio=args.action_video_freq_ratio,
         global_sample_stride=args.global_sample_stride,
+        action_feature=args.action_feature,
+        state_feature=args.state_feature,
         action_keys=list(args.action_key or []),
         state_keys=list(args.state_key or []),
         delta_mask=mask,
@@ -781,7 +826,10 @@ def cmd_generate(args: argparse.Namespace) -> int:
         die(f"数据集目录不存在: {missing}")
 
     policy = build_policy(args)
-    probes = [probe_dataset(path) for path in dataset_paths]
+    probes = [
+        probe_dataset(path, policy.action_feature, policy.state_feature)
+        for path in dataset_paths
+    ]
     plan = merge_probes(probes, policy)
 
     base_name = policy.name
@@ -1299,10 +1347,15 @@ def add_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--action-video-freq-ratio", type=int, default=DEFAULT_FREQ_RATIO)
     parser.add_argument("--global-sample-stride", type=int, default=1)
+    parser.add_argument("--action-feature", default="action", metavar="NAME",
+                        help="LeRobot action feature/column name (default: action; "
+                             "e.g. `actions` for datasets that do not follow the convention)")
+    parser.add_argument("--state-feature", default="observation.state", metavar="NAME",
+                        help="LeRobot state feature/column name (default: observation.state)")
     parser.add_argument("--action-key", action="append", default=[],
-                        help="select action.<key> sub-features (repeatable)")
+                        help="select <action-feature>.<key> sub-features (repeatable)")
     parser.add_argument("--state-key", action="append", default=[],
-                        help="select observation.state.<key> sub-features (repeatable)")
+                        help="select <state-feature>.<key> sub-features (repeatable)")
     parser.add_argument("--delta-mask", default=None,
                         help="comma-separated true/false per action dim, or all-false/all-true")
     parser.add_argument("--norm-mode", choices=["min/max", "z-score"], default="min/max")
