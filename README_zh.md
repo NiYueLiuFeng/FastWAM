@@ -374,12 +374,15 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 
 checkpoint 很占盘：一个 ZeRO-1 checkpoint 约 **106 GB**（权重 12 GB + optimizer state
 约 94 GB）。`configs/train.yaml` 默认只保留最近 2 个（`keep_last_n: 2`）。长任务建议拉长
-保存间隔：
+保存间隔、必要时固定总步数：
 
 ```bash
 # 每 2000 步存一次，只留最近 2 个
 bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
   save_every=2000 keep_last_n=2
+
+# 固定总步数（默认 null = num_epochs × 样本数 / (batch_size × 卡数) 自动算）
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 max_steps=20000
 ```
 
 磁盘配额写满时的报错是 `OSError: [Errno 122] Disk quota exceeded`（在写 checkpoint 时触发），

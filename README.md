@@ -393,12 +393,16 @@ For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs 
 
 Checkpoints are large: one ZeRO-1 checkpoint is ~106 GB on disk (12 GB weights +
 ~94 GB optimizer state). `configs/train.yaml` keeps only the newest 2
-(`keep_last_n: 2`). On long runs, stretch the save interval:
+(`keep_last_n: 2`). On long runs, stretch the save interval and/or cap the step
+count:
 
 ```bash
 # save every 2000 steps, keep the newest 2
 bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
   save_every=2000 keep_last_n=2
+
+# fixed total steps (default null = num_epochs * samples / (batch_size * GPUs))
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 max_steps=20000
 ```
 
 Exhausted disk quota surfaces as `OSError: [Errno 122] Disk quota exceeded`

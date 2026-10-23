@@ -77,6 +77,9 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --online-text-encod
 # 只生成配置、检查前置条件并打印最终命令，不真正训练
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --dry-run
 
+# 固定总步数（0 = 恢复按 epoch 自动算）
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --max-steps 20000
+
 # 长任务：拉长保存间隔 + 只留最近 2 个 checkpoint
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
   --save-every 2000 --keep-last 2
@@ -85,6 +88,21 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
   --extra "model.compile_training_denoise=true"
 ```
+
+#### 训练步数
+
+`max_steps` 缺省为 `null`（按 epoch 自动算）：
+
+```text
+max_steps = ceil(样本数 / (batch_size × GPU 数 × gradient_accumulation_steps)) × num_epochs
+```
+
+- `--epochs N`：改 epoch 数；
+- `--batch-size N`：改全局 batch（步数按比例减少，注意显存）；
+- `--max-steps N`：直接给总步数，优先级高于 `--epochs`；`0` = 交还给 epoch 计算。
+
+`max_steps` 同时决定 cosine 调度器的总长度和 5% warmup，改步数后学习率曲线也会变。
+例：226132 样本、batch 2、4 卡、1 epoch = 28267 步；8 卡 = 14134 步。
 
 #### checkpoint 占用与磁盘清理
 
@@ -446,6 +464,7 @@ runs/mydata_uncond_2cam224_1e-4/{run_id}/
 ```bash
 bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4 \
   save_every=2000 keep_last_n=2      # 每 2000 步存一次，只留最近 2 个
+# 固定总步数：max_steps=20000（null = 按 num_epochs 自动算）
 # 不清理旧 checkpoint：keep_last_n=0
 ```
 
@@ -763,7 +782,7 @@ bash scripts/train_custom.sh \
     --dry-run
 
 # 正式训练：与 dry-run 参数完全一致，去掉 --dry-run
-# 长任务再按需加：--save-every 2000 --keep-last 2
+# 长任务再按需加：--save-every 2000 --keep-last 2 --max-steps 20000
 ```
 
 > `train_custom.sh` 每次都会按 `--dataset / --camera / --action-feature` 重新生成
