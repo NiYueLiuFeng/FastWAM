@@ -46,13 +46,14 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 正式训练时输出同时写终端和日志文件（`--dry-run` 不写）：
 
 ```text
-<repo>/log/<yyyy-mm-dd>_<model>_<task>.log
-# 例：log/2026-10-23_fastwam_autogen_my_ds.log
+<repo>/log/<yyyy-mm-dd-hhmm>_<model>_<task>.log
+# 例：log/2026-10-23-1105_fastwam_autogen_my_ds.log
 ```
 
 - `<model>` 依次取 `--model`、`--extra "model=..."`、task 配置里的 `override /model:`；
-- 同一天、同模型、同任务再次运行会**追加**到同一文件，每次用 `=====` 分隔并记录
-  启动时间和完整命令；
+- 时间戳精确到分钟（文件名里不含空格和冒号）；同一分钟内、同模型、同任务再次运行会
+  **追加**到同一文件，每次用 `=====` 分隔并记录启动时间和完整命令；换到下一分钟就是
+  新文件，多次重启的历史不会被覆盖，可据此区分不同批次的训练；
 - 需要换目录用 `--log-dir PATH`（或环境变量 `LOG_DIR`），不需要日志用 `--no-log`；
 - 日志文件已被 `.gitignore` 的 `*.log` 忽略，不会误提交。
 

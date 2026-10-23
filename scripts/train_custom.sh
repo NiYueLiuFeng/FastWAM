@@ -100,7 +100,7 @@ usage() {
   -h, --help               显示本帮助
 
   正式训练时输出同时写终端和日志文件：
-    <repo>/log/<yyyy-mm-dd>_<model>_<task>.log（同一天同名任务追加写，用 ==== 分隔）
+    <repo>/log/<yyyy-mm-dd-hhmm>_<model>_<task>.log（同一分钟内同名任务追加写，用 ==== 分隔）
 
 环境变量:
   MIN_FREE_GPU_MEM_GB      启动前要求每张卡的 idle 显存（GiB，默认 24；0 关闭检查）
@@ -482,10 +482,11 @@ if (( NO_LOG )); then
   exit "$status"
 fi
 
-# Log file: <repo>/log/<yyyy-mm-dd>_<model>_<task>.log. Same day + same
-# model + same task appends, so an earlier run of the day is never lost.
+# Log file: <repo>/log/<yyyy-mm-dd-hhmm>_<model>_<task>.log (no spaces or
+# colons in the name). Same minute + model + task appends; a new minute starts
+# a new file, so restarts never overwrite history.
 mkdir -p "$LOG_DIR" || die "无法创建日志目录: $LOG_DIR"
-LOG_FILE="${LOG_DIR}/$(date +%Y-%m-%d)_$(model_tag)_$(path_tag "$TASK_NAME").log"
+LOG_FILE="${LOG_DIR}/$(date +%Y-%m-%d-%H%M)_$(model_tag)_$(path_tag "$TASK_NAME").log"
 {
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') train_custom ====="
   echo "task:  $TASK_NAME"
