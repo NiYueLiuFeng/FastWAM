@@ -35,6 +35,7 @@ GPUS=""
 MODEL=""
 EPOCHS=""
 BATCH_SIZE=""
+MAX_STEPS=""
 LR=""
 NUM_WORKERS=""
 SAVE_EVERY=""
@@ -85,6 +86,7 @@ usage() {
   --gpus N                 使用卡数（默认：当前可见 GPU 数）
   --model NAME             fastwam / fastwam_idm / fastwam_joint / fastwam_optional_idm
   --epochs N, --batch-size N, --lr LR, --num-workers N, --save-every N
+  --max-steps N            固定总步数（默认 null：按 --epochs × 样本数/(batch×卡数) 自动算；0 = 恢复自动）
   --keep-last N            只保留最近 N 个 checkpoint（默认取 configs/train.yaml，0 = 全留）
   --resume PATH            断点续训（目录或权重 .pt）
   --norm-stats PATH        data.train.pretrained_norm_stats
@@ -289,6 +291,11 @@ while [[ $# -gt 0 ]]; do
       NUM_WORKERS="$2"
       shift 2
       ;;
+    --max-steps)
+      need_value "$@"
+      MAX_STEPS="$2"
+      shift 2
+      ;;
     --save-every)
       need_value "$@"
       SAVE_EVERY="$2"
@@ -457,6 +464,15 @@ if [[ -n "$EPOCHS" ]]; then SETS+=("num_epochs=$EPOCHS"); fi
 if [[ -n "$BATCH_SIZE" ]]; then SETS+=("batch_size=$BATCH_SIZE"); fi
 if [[ -n "$LR" ]]; then SETS+=("learning_rate=$LR"); fi
 if [[ -n "$NUM_WORKERS" ]]; then SETS+=("num_workers=$NUM_WORKERS"); fi
+if [[ -n "$MAX_STEPS" ]]; then
+  [[ "$MAX_STEPS" =~ ^[0-9]+$ ]] \
+    || die "--max-steps 必须是整数（0 = 交还给 epoch 自动计算），实际为 $MAX_STEPS"
+  if [[ "$MAX_STEPS" =~ ^0+$ ]]; then
+    SETS+=("max_steps=null")
+  else
+    SETS+=("max_steps=$MAX_STEPS")
+  fi
+fi
 if [[ -n "$SAVE_EVERY" ]]; then SETS+=("save_every=$SAVE_EVERY"); fi
 if [[ -n "$KEEP_LAST" ]]; then SETS+=("keep_last_n=$KEEP_LAST"); fi
 if [[ -n "$RESUME" ]]; then SETS+=("resume=$RESUME"); fi

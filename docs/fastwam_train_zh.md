@@ -116,6 +116,7 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 | `--gpus N` | 使用卡数（默认自动探测） |
 | `--model NAME` | `fastwam` / `fastwam_idm` / `fastwam_joint` / `fastwam_optional_idm` |
 | `--epochs N` / `--batch-size N` / `--lr LR` / `--num-workers N` / `--save-every N` | 训练超参 |
+| `--max-steps N` | 固定总步数（`max_steps`）；默认 `null` = 按 `--epochs` 与样本数自动算，`0` = 恢复自动，见 10.5 |
 | `--keep-last N` | 只保留最近 N 个 checkpoint（`keep_last_n`，0 = 全留，见第 11 节） |
 | `--resume PATH` | 断点续训（目录或权重 `.pt`） |
 | `--norm-stats PATH` | 写入 `data.train.pretrained_norm_stats` |
@@ -722,6 +723,7 @@ episode 长度只用于校验采样窗口，不会被写进配置。
 | `learning_rate` | `1e-4` | `:52` |
 | `save_every` | `100` | `:53` |
 | `keep_last_n` | `2`（只保留最近 2 个 checkpoint） | `:55` |
+| `max_steps` | `None`（按 epoch 与样本数自动算，见 10.5） | `:57` |
 | `resize` | `224 × 224` | `Policy` 定义 `:427` |
 | `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:428` 与 `merge_probes()` |
 | `global_sample_stride` | `1` | `:432` |
@@ -776,7 +778,39 @@ runs/<task>/<run_id>/config.yaml
 对应 `src/fastwam/runtime.py:462-464` 的
 `OmegaConf.to_container(cfg, resolve=True)` + `OmegaConf.save(...)`。
 
-### 10.5 注意事项
+### 10.5 训练步数：num_epochs / batch_size / max_steps
+
+`max_steps` 为 `null`（默认）时，训练器启动时按下式算总步数
+（`src/fastwam/trainer.py:230` `_estimate_total_train_steps()`）：
+
+```text
+max_steps = ceil(样本数 / (batch_size × GPU 数 × gradient_accumulation_steps)) × num_epochs
+```
+
+当前 `autogen_mixed_flexiv_charger_white`（226132 样本、batch 2、4 卡、1 epoch）：
+
+| GPU | max_steps |
+| --- | --- |
+| 1 | 113066 |
+| 4 | 28267 |
+| 8 | 14134 |
+
+三个参数都能从命令行传：
+
+```bash
+--epochs 3                      # 3 个 epoch -> 84801 步
+--batch-size 4                  # 4 卡时 -> 14134 步
+--max-steps 10000               # 直接给步数，忽略 epoch 计算
+--max-steps 0                   # 恢复自动（写回 max_steps: null）
+```
+
+`--max-steps` 非空时优先于 `--epochs`。它会同时决定 cosine 调度器的总长度和
+5% warmup（`trainer.py:100-107`），改步数后学习率曲线的形状也会跟着变。
+
+优先级：命令行 `--max-steps` / `--extra max_steps=...` > 生成的 task 配置
+（`generate --max-steps N`）> `configs/train.yaml:20` 的 `null`。
+
+### 10.6 注意事项
 
 - `context_len` 默认 `128` 来自生成器常量，模型侧的 `model.tokenizer_max_len`
   默认也是 `128`（`configs/model/fastwam.yaml`）。如果用 `--context-len` 改成

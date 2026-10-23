@@ -53,6 +53,8 @@ DEFAULT_LR = 1e-4
 DEFAULT_SAVE_EVERY = 100
 # 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
 DEFAULT_KEEP_LAST_N = 2
+# None = 按 num_epochs 和样本数自动算总步数（见 fastwam/trainer.py:_estimate_total_train_steps）。
+DEFAULT_MAX_STEPS: int | None = None
 
 _SENTINEL = object()
 
@@ -445,6 +447,7 @@ class Policy:
     learning_rate: float = DEFAULT_LR
     save_every: int = DEFAULT_SAVE_EVERY
     keep_last_n: int = DEFAULT_KEEP_LAST_N
+    max_steps: int | None = DEFAULT_MAX_STEPS
 
 
 @dataclass
@@ -768,6 +771,7 @@ def render_data_yaml(plan: Plan) -> str:
 
 
 def render_task_yaml(task_name: str, model: str, policy: Policy, datasets: Sequence[Path]) -> str:
+    max_steps = "null" if policy.max_steps is None else str(policy.max_steps)
     return (
         "# @package _global_\n"
         + _header(datasets)
@@ -781,7 +785,7 @@ def render_task_yaml(task_name: str, model: str, policy: Policy, datasets: Seque
         + 'lr_scheduler_type: "cosine"\n'
         + f"learning_rate: {policy.learning_rate}\n"
         + f"num_epochs: {policy.num_epochs}\n"
-        + "max_steps: null\n"
+        + f"max_steps: {max_steps}\n"
         + "log_every: 10\n"
         + f"save_every: {policy.save_every}\n"
         + f"keep_last_n: {policy.keep_last_n}\n"
@@ -863,6 +867,7 @@ def build_policy(args: argparse.Namespace) -> Policy:
         learning_rate=args.lr,
         save_every=args.save_every,
         keep_last_n=args.keep_last,
+        max_steps=args.max_steps or None,
     )
 
 
@@ -1413,6 +1418,8 @@ def add_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS,
+                        help="fixed optimizer steps (0/unset = derive from --epochs and dataset size)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
     parser.add_argument("--keep-last", type=int, default=DEFAULT_KEEP_LAST_N,
