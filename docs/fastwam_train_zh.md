@@ -116,6 +116,7 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 | `--gpus N` | 使用卡数（默认自动探测） |
 | `--model NAME` | `fastwam` / `fastwam_idm` / `fastwam_joint` / `fastwam_optional_idm` |
 | `--epochs N` / `--batch-size N` / `--lr LR` / `--num-workers N` / `--save-every N` | 训练超参 |
+| `--keep-last N` | 只保留最近 N 个 checkpoint（`keep_last_n`，0 = 全留，见第 11 节） |
 | `--resume PATH` | 断点续训（目录或权重 `.pt`） |
 | `--norm-stats PATH` | 写入 `data.train.pretrained_norm_stats` |
 | `--backbone PATH` | 自定义 ActionDiT backbone |
@@ -216,7 +217,7 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
 | `delta_action_dim_mask` | 全 `false`（delta 语义无法从数据推断） |
 | 归一化 | `min/max` |
 | 文本缓存 | `./data/text_embeds_cache/autogen_<name>`，`context_len=128` |
-| 训练超参 | `batch_size=2`、`num_workers=4`、`num_epochs=1`、`lr=1e-4`、`save_every=100` |
+| 训练超参 | `batch_size=2`、`num_workers=4`、`num_epochs=1`、`lr=1e-4`、`save_every=100`、`keep_last_n=2` |
 | 模型 | `fastwam` |
 
 `--concat null` 且多相机时必须显式给 `--video-size`；`robotwin` 布局与相机顺序/尺寸强相关，
@@ -315,6 +316,7 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+keep_last_n: 2
 eval_every: 50
 gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
@@ -719,17 +721,18 @@ episode 长度只用于校验采样窗口，不会被写进配置。
 | `num_epochs` | `1` | `:51` |
 | `learning_rate` | `1e-4` | `:52` |
 | `save_every` | `100` | `:53` |
-| `resize` | `224 × 224` | `Policy` 定义 `:351` |
-| `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:352` 与 `merge_probes()` |
-| `global_sample_stride` | `1` | `:356` |
+| `keep_last_n` | `2`（只保留最近 2 个 checkpoint） | `:55` |
+| `resize` | `224 × 224` | `Policy` 定义 `:427` |
+| `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:428` 与 `merge_probes()` |
+| `global_sample_stride` | `1` | `:432` |
 | `delta_action_dim_mask` | 全 `false` | `parse_delta_mask()` |
-| `norm_default_mode` | `min/max` | `:360` |
-| `val_set_proportion` | `0.0` | `:361` |
+| `norm_default_mode` | `min/max` | `:436` |
+| `val_set_proportion` | `0.0` | `:437` |
 | `video_size` | 由 `resize` + 拼接方式计算（如 2 相机水平 → `[224, 448]`） | `merge_probes()` |
 | 文本缓存目录 | `./data/text_embeds_cache/autogen_<name>` | `merge_probes()` |
 
-argparse 的默认值定义在 `:1285-1318`；`build_policy()`（`:748`）把这些值装进
-`Policy`；`render_data_yaml()`（`:674`）和 `render_task_yaml()`（`:682`）
+argparse 的默认值定义在 `add_generate_arguments()`（`:1384`）；`build_policy()`（`:841`）
+把这些值装进 `Policy`；`render_data_yaml()`（`:765`）和 `render_task_yaml()`（`:773`）
 负责写文件。
 
 ### 10.3 Hydra 基座配置提供的值
@@ -745,7 +748,7 @@ autogen 配置只写它关心的字段，其余字段在 `verify` 和训练时�
 
 ```text
 batch_size, num_workers, lr_scheduler_type, learning_rate, num_epochs,
-max_steps, log_every, save_every, eval_every, gradient_accumulation_steps,
+max_steps, log_every, save_every, keep_last_n, eval_every, gradient_accumulation_steps,
 weight_decay, resume
 ```
 
@@ -788,3 +791,51 @@ runs/<task>/<run_id>/config.yaml
 - 生成器常量不会随 `configs/train.yaml` 的修改自动变化。例如改基座的
   `batch_size` 不会影响 autogen task 配置；需要显式传 `--batch-size`
   或直接改生成的 task 配置。
+
+---
+
+## 11. checkpoint 与磁盘配额
+
+一次 `save_checkpoint()` 会写两份东西：
+
+| 目录 | 内容 | 单次大小（4 卡、Wan2.2 规模） |
+| --- | --- | --- |
+| `checkpoints/weights/step_XXXXXX.pt` | 推理用权重 | ≈ 12 GB |
+| `checkpoints/state/step_XXXXXX/` | DeepSpeed ZeRO-1 全量状态（每张卡一份 optim state + 模型状态） | ≈ 94 GB |
+
+也就是**每个 checkpoint 约 106 GB**，而默认 `save_every: 100`。
+以 28267 步、4 卡为例：283 次 × 106 GB ≈ **30 TB**，磁盘会先被打满，
+而且是在训练中途，表现为三类报错一起出现：
+
+```text
+RuntimeError: [enforce fail at inline_container.cc:857] . PytorchStreamWriter failed writing file data/0: file write failed
+OSError: [Errno 122] Disk quota exceeded
+tee: /workspace/FastWAM/log/xxx.log: Disk quota exceeded
+```
+
+checkpoint、日志 `tee`、DeepSpeed Triton autotune 缓存同时写失败，说明是磁盘写不进去，
+与模型、数据集和代码无关。注意在 SFS Turbo 上 `df` 报的是整个文件系统，
+目录配额打满时 `df` 仍然显示有空闲，只能靠实际写文件（`errno 122`）判断。
+
+控制方式：
+
+- `--save-every N`：拉长间隔。每次保存要写 ~106 GB，期间训练是停住的，
+  100 步（约 2 分钟）保存一次等于把训练时间翻倍，长任务建议 1000~2000。
+- `--keep-last N`（Hydra 键 `keep_last_n`）：只保留最近 N 个 weights/state，
+  每次保存后自动删更旧的；`0` = 全留。`configs/train.yaml` 默认 `2`。
+- `--resume` 需要保留被续训的那个 `state/step_XXXXXX`，所以 `keep_last_n` 至少 1。
+
+手工清理（保留最新一次，其余全删）：
+
+```bash
+cd runs/<task>/<run_id>/checkpoints
+ls -d state/step_* | sort | head -n -1 | xargs -r rm -rf   # 留最新 state
+ls weights/step_*.pt | sort | head -n -1 | xargs -r rm -f  # 留最新权重
+```
+
+保存中断留下的 `state/step_XXXXXX/` 是不完整的（`torch.save` 半截文件），
+不能用于续训，直接删掉；同一 step 的 `weights/*.pt` 通常已经写完，可以保留。
+
+`train_custom.sh` 在启动前会往 `<repo>/runs` 试写一个 `WRITE_PROBE_MB`
+（默认 64 MiB）的探针文件，写失败立即退出并打印上面的清理提示，
+避免训练跑 40 分钟才在第一次保存时崩掉。

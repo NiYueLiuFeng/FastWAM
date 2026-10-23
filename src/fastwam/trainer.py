@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -41,6 +42,8 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        # 0 keeps every checkpoint; a positive value keeps only the newest N.
+        self.keep_last_n = int(cfg.get("keep_last_n", 0) or 0)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -603,6 +606,52 @@ class Wan22Trainer:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
+    def _prune_checkpoints(self):
+        """Keep only the newest `keep_last_n` weights/state checkpoints.
+
+        A ZeRO-1 state costs ~4x the model size on disk, so an unconditional
+        save_every fills the filesystem long before training ends. Pruning is
+        main-process only; the other ranks are idle at the barrier.
+        """
+        keep = self.keep_last_n
+        if keep <= 0:
+            return
+
+        removed = []
+        entries = []
+        for directory, pattern in ((self.state_dir, "*"), (self.weights_dir, "*.pt")):
+            found = []
+            for path in Path(directory).glob(pattern):
+                match = re.search(r"step[_-](\d+)$", path.stem)
+                if match is not None:
+                    found.append((int(match.group(1)), path))
+            found.sort()
+            # trainer_state.json is written last, so a state dir without it is a
+            # save that died halfway (disk full, killed): it cannot be resumed
+            # and must not occupy a keep slot.
+            incomplete = [
+                entry for entry in found
+                if entry[1].is_dir() and not (entry[1] / "trainer_state.json").exists()
+            ]
+            found = [entry for entry in found if entry not in incomplete]
+            entries.extend(incomplete)
+            entries.extend(found[:-keep] if len(found) > keep else [])
+        for _, path in entries:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed.append(path.name)
+            except OSError as exc:
+                logger.warning("Failed to prune checkpoint %s: %s", path, exc)
+        if removed:
+            logger.info(
+                "[ckpt] 已清理旧 checkpoint（保留最近 %d 个）: %s",
+                keep,
+                ", ".join(sorted(removed)),
+            )
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -618,6 +667,9 @@ class Wan22Trainer:
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
         self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            self._prune_checkpoints()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 

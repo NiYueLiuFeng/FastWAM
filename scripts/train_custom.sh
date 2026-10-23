@@ -38,6 +38,7 @@ BATCH_SIZE=""
 LR=""
 NUM_WORKERS=""
 SAVE_EVERY=""
+KEEP_LAST=""
 RESUME=""
 NORM_STATS=""
 BACKBONE=""
@@ -84,6 +85,7 @@ usage() {
   --gpus N                 使用卡数（默认：当前可见 GPU 数）
   --model NAME             fastwam / fastwam_idm / fastwam_joint / fastwam_optional_idm
   --epochs N, --batch-size N, --lr LR, --num-workers N, --save-every N
+  --keep-last N            只保留最近 N 个 checkpoint（默认取 configs/train.yaml，0 = 全留）
   --resume PATH            断点续训（目录或权重 .pt）
   --norm-stats PATH        data.train.pretrained_norm_stats
   --backbone PATH          自定义 ActionDiT backbone 路径
@@ -104,6 +106,7 @@ usage() {
 
 环境变量:
   MIN_FREE_GPU_MEM_GB      启动前要求每张卡的 idle 显存（GiB，默认 24；0 关闭检查）
+  WRITE_PROBE_MB           启动前试写 <repo>/runs 的探针大小（MiB，默认 64）
   LOG_DIR                  日志目录（等价于 --log-dir）
 EOF
 }
@@ -177,6 +180,33 @@ check_gpu_memory() {
     printf '%s\n' "${details[@]}"
     echo "本次要用 ${GPUS} 张卡，其中 ${short} 张空闲显存不够。用 nvidia-smi 看是哪张卡上还有别的进程。"
     echo "处理方式：换到空闲卡；等占用显存的任务结束后再跑；确认要强行启动时加 --skip-prereq-check。"
+  } >&2
+  exit 1
+}
+
+# Fail fast when the output directory cannot be written. SFS Turbo's directory
+# quota does not show up in `df` (that reports the whole filesystem), so the
+# only reliable check is to actually write something: quota exhaustion surfaces
+# as errno 122 "Disk quota exceeded" long after the run has started, usually
+# while saving the first checkpoint.
+check_output_writable() {
+  local dir="${REPO_ROOT}/runs"
+  mkdir -p "$dir" 2>/dev/null || return 0
+
+  local probe="${dir}/.write_probe.$$"
+  if dd if=/dev/zero of="$probe" bs=1M count="${WRITE_PROBE_MB:-64}" status=none 2>/dev/null; then
+    rm -f "$probe"
+    return 0
+  fi
+  rm -f "$probe"
+
+  {
+    echo "error: 输出目录写不进去：$dir"
+    echo "（配额打满时错误为 errno 122 'Disk quota exceeded'；df 此时仍显示有空间，所以只能靠试写发现）"
+    echo "处理方式："
+    echo "  1. 清理旧的 runs/*/checkpoints/state/step_*（一个 ZeRO-1 state 约为模型权重的 4 倍）"
+    echo "  2. 用 --save-every N 拉长间隔、--keep-last N 只留最近几个（默认 configs/train.yaml，建议 2）"
+    echo "  3. 用 --log-dir 把日志、--extra output_dir=... 把输出挪到别的位置"
   } >&2
   exit 1
 }
@@ -262,6 +292,11 @@ while [[ $# -gt 0 ]]; do
     --save-every)
       need_value "$@"
       SAVE_EVERY="$2"
+      shift 2
+      ;;
+    --keep-last)
+      need_value "$@"
+      KEEP_LAST="$2"
       shift 2
       ;;
     --resume)
@@ -365,6 +400,7 @@ fi
 
 if (( SKIP_PREREQ == 0 )); then
   check_gpu_memory
+  check_output_writable
 fi
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
@@ -422,6 +458,7 @@ if [[ -n "$BATCH_SIZE" ]]; then SETS+=("batch_size=$BATCH_SIZE"); fi
 if [[ -n "$LR" ]]; then SETS+=("learning_rate=$LR"); fi
 if [[ -n "$NUM_WORKERS" ]]; then SETS+=("num_workers=$NUM_WORKERS"); fi
 if [[ -n "$SAVE_EVERY" ]]; then SETS+=("save_every=$SAVE_EVERY"); fi
+if [[ -n "$KEEP_LAST" ]]; then SETS+=("keep_last_n=$KEEP_LAST"); fi
 if [[ -n "$RESUME" ]]; then SETS+=("resume=$RESUME"); fi
 if [[ -n "$NORM_STATS" ]]; then SETS+=("data.train.pretrained_norm_stats=$NORM_STATS"); fi
 if [[ -n "$BACKBONE" ]]; then SETS+=("model.action_dit_pretrained_path=$BACKBONE"); fi

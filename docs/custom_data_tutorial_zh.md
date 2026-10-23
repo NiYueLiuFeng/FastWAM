@@ -326,7 +326,8 @@ learning_rate: 1e-4
 num_epochs: 10                         # ← 按数据规模调整
 max_steps: null
 log_every: 10
-save_every: 2000
+save_every: 2000                      # 每个 checkpoint ≈ 106 GB，别设太密
+keep_last_n: 2                        # 只保留最近 2 个（configs/train.yaml 默认也是 2）
 eval_every: 200
 
 # training

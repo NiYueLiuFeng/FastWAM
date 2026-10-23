@@ -51,6 +51,8 @@ DEFAULT_NUM_WORKERS = 4
 DEFAULT_EPOCHS = 1
 DEFAULT_LR = 1e-4
 DEFAULT_SAVE_EVERY = 100
+# 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
+DEFAULT_KEEP_LAST_N = 2
 
 _SENTINEL = object()
 
@@ -442,6 +444,7 @@ class Policy:
     num_epochs: int = DEFAULT_EPOCHS
     learning_rate: float = DEFAULT_LR
     save_every: int = DEFAULT_SAVE_EVERY
+    keep_last_n: int = DEFAULT_KEEP_LAST_N
 
 
 @dataclass
@@ -781,6 +784,7 @@ def render_task_yaml(task_name: str, model: str, policy: Policy, datasets: Seque
         + "max_steps: null\n"
         + "log_every: 10\n"
         + f"save_every: {policy.save_every}\n"
+        + f"keep_last_n: {policy.keep_last_n}\n"
         + "eval_every: 50\n"
         + "gradient_accumulation_steps: 1\n"
         + "weight_decay: 1.0e-2\n"
@@ -858,6 +862,7 @@ def build_policy(args: argparse.Namespace) -> Policy:
         num_epochs=args.epochs,
         learning_rate=args.lr,
         save_every=args.save_every,
+        keep_last_n=args.keep_last,
     )
 
 
@@ -1410,6 +1415,8 @@ def add_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
+    parser.add_argument("--keep-last", type=int, default=DEFAULT_KEEP_LAST_N,
+                        help="keep only the newest N checkpoints (0 = keep all)")
     parser.add_argument("--force", action="store_true", help="overwrite hand-written target configs")
     parser.add_argument("--print-name", action="store_true", help="print only the generated task name")
 
