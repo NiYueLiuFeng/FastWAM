@@ -5,6 +5,7 @@ import torch
 import numpy as np
 from copy import deepcopy
 from ..utils.normalizer import LinearNormalizer, NormMode
+from ..transforms.relative_action import RelativeActionTransform
 from fastwam.utils.pytorch_utils import dict_apply
 from fastwam.utils.logging_config import get_logger
 from .base_processor import BaseProcessor
@@ -41,6 +42,8 @@ class FastWAMProcessor(BaseProcessor):
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
         num_image_steps: Optional[int] = None,
+        delta_action_dims: Optional[List[int]] = None,
+        delta_action_base: str = "first",
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
@@ -68,6 +71,24 @@ class FastWAMProcessor(BaseProcessor):
         self._normalizer = None
 
         self.tokenizer = tokenizer
+
+        # Optional delta-action adaptation: the selected action dims are stored
+        # as offsets from a reference observation (state[..., :1, :] by
+        # default) and converted back to absolute values in postprocess().
+        self.delta_action_dims = None
+        self.delta_action_base = delta_action_base
+        if delta_action_dims is not None:
+            transform = self._build_delta_action_transform(delta_action_dims, delta_action_base)
+            # Run first: it only reads the raw state, so any later transform
+            # (e.g. RelativePoseTransform) still sees a consistent batch.
+            if action_state_transforms:
+                logger.warning(
+                    "`delta_action_dims` is applied before `action_state_transforms`; "
+                    "its dim indices refer to the raw action vector."
+                )
+            self.action_state_transforms = [transform] + list(action_state_transforms or [])
+            delta_action_dim_mask = self._merge_delta_action_mask(delta_action_dim_mask)
+
         if delta_action_dim_mask is None:
             self.delta_action_dim_mask = None
         else:
@@ -89,6 +110,82 @@ class FastWAMProcessor(BaseProcessor):
                         f"`delta_action_dim_mask[{key}]` length must be {expected_dim}, got {len(mask)}."
                     )
                 self.delta_action_dim_mask[key] = torch.as_tensor(mask, dtype=torch.bool)
+
+    def _build_delta_action_transform(self, dims, base_frame: str):
+        if base_frame not in ("last", "first"):
+            raise ValueError(f"`delta_action_base` must be 'last' or 'first', got {base_frame!r}")
+        action_meta = self.shape_meta["action"]
+        # Dim indices refer to the raw action vector: this transform runs first.
+        total = sum(int(meta.get("raw_shape", meta["shape"])) for meta in action_meta)
+        selected = sorted({int(dim) for dim in dims})
+        if not selected:
+            raise ValueError("`delta_action_dims` must contain at least one action dim.")
+        invalid = [dim for dim in selected if dim < 0 or dim >= total]
+        if invalid:
+            raise ValueError(
+                f"`delta_action_dims` {invalid} out of range for action dim {total}."
+            )
+        # Split the flat dim indices over the per-key action vectors.
+        per_key: Dict[str, List[int]] = {}
+        action_dims_by_key: Dict[str, int] = {}
+        offset = 0
+        for meta in action_meta:
+            key = meta["key"]
+            key_dim = int(meta.get("raw_shape", meta["shape"]))
+            action_dims_by_key[key] = key_dim
+            local = [dim - offset for dim in selected if offset <= dim < offset + key_dim]
+            if local:
+                if int(meta["shape"]) != key_dim:
+                    raise ValueError(
+                        f"`delta_action_dims` cannot be combined with a transform that changes "
+                        f"dims for action key {key!r} (raw_shape={key_dim}, "
+                        f"shape={int(meta['shape'])})."
+                    )
+                per_key[key] = local
+            offset += key_dim
+        state_meta = {meta["key"]: meta for meta in self.shape_meta["state"]}
+        missing = [key for key in per_key if key not in state_meta]
+        if missing:
+            raise ValueError(
+                f"`delta_action_dims` needs a matching state key for action keys {missing}; "
+                f"available state keys: {sorted(state_meta)}."
+            )
+        for key, local_dims in per_key.items():
+            state_dim = int(state_meta[key].get("raw_shape", state_meta[key]["shape"]))
+            if max(local_dims) >= state_dim:
+                raise ValueError(
+                    f"`delta_action_dims` uses action dim {max(local_dims)} for {key!r}, "
+                    f"but its state only has {state_dim} dims."
+                )
+            if state_dim != action_dims_by_key[key]:
+                logger.warning(
+                    f"delta action key {key!r}: state has {state_dim} dims but action has "
+                    f"{action_dims_by_key[key]}; the dims are matched positionally."
+                )
+        self.delta_action_dims = selected
+        return RelativeActionTransform(list(per_key), per_key, base_frame=base_frame)
+
+    def _merge_delta_action_mask(self, delta_action_dim_mask):
+        """Mark the delta dims in the pad-zeroing mask (OR with the user mask)."""
+        if delta_action_dim_mask is None:
+            merged = {
+                meta["key"]: [False] * int(meta["shape"])
+                for meta in self.shape_meta["action"]
+            }
+        else:
+            merged = {key: list(mask) for key, mask in delta_action_dim_mask.items()}
+        offset = 0
+        for meta in self.shape_meta["action"]:
+            key = meta["key"]
+            key_dim = int(meta.get("raw_shape", meta["shape"]))
+            if key not in merged:
+                merged[key] = [False] * int(meta["shape"])
+            for dim in self.delta_action_dims or []:
+                local = dim - offset
+                if 0 <= local < key_dim and local < len(merged[key]):
+                    merged[key][local] = True
+            offset += key_dim
+        return merged
 
     @property
     def is_train(self):
@@ -250,6 +347,9 @@ class FastWAMProcessor(BaseProcessor):
             sample["gt_action"] = deepcopy(data["action"])
 
         # 3. action & state
+        data = self.action_state_transform(data)
+        # Zero padded delta frames *after* the transform: for relative actions
+        # the padded absolute value is meaningless, the delta must be 0.
         if "action" in data and self.delta_action_dim_mask is not None:
             action_is_pad = torch.as_tensor(data["action_is_pad"], dtype=torch.bool)
             if bool(action_is_pad.any().item()):
@@ -259,7 +359,6 @@ class FastWAMProcessor(BaseProcessor):
                     cur_dim_mask = dim_mask.to(device=cur_action.device)
                     pad_delta_mask = cur_action_is_pad.unsqueeze(1) & cur_dim_mask.unsqueeze(0)
                     cur_action[pad_delta_mask] = 0.0
-        data = self.action_state_transform(data)
         data = self.normalizer.forward(data)
         data = self.action_state_merger.forward(data)
 

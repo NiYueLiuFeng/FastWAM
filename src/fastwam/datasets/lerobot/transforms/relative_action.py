@@ -81,6 +81,67 @@ class RelativePoseTransform:
         return base_pose_matrix @ pose_matrix
     
 
+class RelativeActionTransform:
+    """Convert selected action dims into offsets from an observation state.
+
+    Unlike :class:`RelativePoseTransform`, this works on raw vector dims and
+    does not assume quaternion layout, so it can be applied to any LeRobot
+    action column (e.g. x, y, z + Euler angles + gripper + wrench).
+
+    Only the dims listed in ``dims`` are converted; all other dims keep their
+    absolute value.  ``base_frame`` selects the reference observation:
+
+    - ``"first"`` (default) uses ``state[..., :1, :]``.  The action chunk of a
+      training sample starts at the first observation frame (both
+      ``observation.state`` and ``action`` use delta timestamps 0..T-1), and
+      ``FastWAM`` conditions on ``proprio[:, 0, :]``, so this is the frame the
+      deployed policy sees as "current".
+    - ``"last"`` uses ``state[..., -1:, :]``, matching
+      :class:`RelativePoseTransform`.
+
+    ``dims`` is either a flat list of dim indices applied to every key, or a
+    ``{key: dims}`` mapping.  ``state`` may be ``[..., T, D]`` or ``[..., 1, D]``;
+    the reference is taken on the time axis and broadcasts over the action
+    horizon.
+    """
+
+    def __init__(self, keys: List[str], dims, base_frame: str = "first"):
+        if base_frame not in ("last", "first"):
+            raise ValueError(f"base_frame must be 'last' or 'first', got {base_frame!r}")
+        self.keys = list(keys)
+        if isinstance(dims, dict):
+            self.dims: Dict[str, List[int]] = {k: list(dims.get(k, [])) for k in self.keys}
+        else:
+            self.dims = {k: list(dims) for k in self.keys}
+        self.base_frame = base_frame
+
+    def _reference(self, state: torch.Tensor) -> torch.Tensor:
+        if state.ndim < 2:
+            return state
+        return state[..., -1:, :] if self.base_frame == "last" else state[..., :1, :]
+
+    def _apply(self, batch: Dict, sign: float):
+        for k in self.keys:
+            dims = self.dims[k]
+            if not dims or k not in batch["action"]:
+                continue
+            # Clone: batch tensors may alias dataset storage.
+            action = batch["action"][k].clone()
+            reference = self._reference(batch["state"][k])
+            action[..., dims] = action[..., dims] + sign * reference[..., dims]
+            batch["action"][k] = action
+        return batch
+
+    def forward(self, batch: Dict):
+        # for close-loop eval, "action" may not be in batch
+        if "action" not in batch:
+            return batch
+        return self._apply(batch, sign=-1.0)
+
+    def backward(self, batch: Dict):
+        return self._apply(batch, sign=1.0)
+
+
 class RelativeJointTransform:
     def __init__(self, keys: List[str]):
         self.keys = keys
