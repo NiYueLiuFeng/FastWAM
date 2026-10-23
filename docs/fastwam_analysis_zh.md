@@ -739,6 +739,8 @@ python scripts/precompute_text_embeds.py                # 生成 T5 embedding �
 # 1) 训练（单阶段）
 bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
 # IDM / joint / optional-idm 换 task 配置即可
+# 长任务：一个 ckpt ≈ 106 GB，默认只留最近 2 个（keep_last_n: 2）
+#   bash scripts/train_zero1.sh 8 task=<task> save_every=2000 keep_last_n=2
 
 # 2) LIBERO 评测
 python experiments/libero/eval_libero_single.py \

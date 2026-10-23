@@ -391,6 +391,19 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 
 For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
 
+Checkpoints are large: one ZeRO-1 checkpoint is ~106 GB on disk (12 GB weights +
+~94 GB optimizer state). `configs/train.yaml` keeps only the newest 2
+(`keep_last_n: 2`). On long runs, stretch the save interval:
+
+```bash
+# save every 2000 steps, keep the newest 2
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
+  save_every=2000 keep_last_n=2
+```
+
+Exhausted disk quota surfaces as `OSError: [Errno 122] Disk quota exceeded`
+while a checkpoint is being written; see `docs/fastwam_train_zh.md` §11.
+
 ## Inference with Your Trained Checkpoints
 
 The `mujoco` environment should ideally stay consistent with the LIBERO data version. Then run LIBERO evaluation:

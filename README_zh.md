@@ -372,6 +372,19 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 
 对于LIBERO，我们使用单机8卡训练。对于RoboTwin，我们使用了64卡来加速训练，你可以尝试调小卡数和训练总epoch数。
 
+checkpoint 很占盘：一个 ZeRO-1 checkpoint 约 **106 GB**（权重 12 GB + optimizer state
+约 94 GB）。`configs/train.yaml` 默认只保留最近 2 个（`keep_last_n: 2`）。长任务建议拉长
+保存间隔：
+
+```bash
+# 每 2000 步存一次，只留最近 2 个
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
+  save_every=2000 keep_last_n=2
+```
+
+磁盘配额写满时的报错是 `OSError: [Errno 122] Disk quota exceeded`（在写 checkpoint 时触发），
+详见 `docs/fastwam_train_zh.md` 第 11 节。
+
 ## 使用自己训练的权重推理
 
 `mujoco` 环境和 LIBERO 数据版本相关，最好保持一致。之后再运行 LIBERO 评测：

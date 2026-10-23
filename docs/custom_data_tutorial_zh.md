@@ -77,10 +77,39 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --online-text-encod
 # 只生成配置、检查前置条件并打印最终命令，不真正训练
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --dry-run
 
+# 长任务：拉长保存间隔 + 只留最近 2 个 checkpoint
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
+  --save-every 2000 --keep-last 2
+
 # 追加/覆盖任意 Hydra 参数
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
   --extra "model.compile_training_denoise=true"
 ```
+
+#### checkpoint 占用与磁盘清理
+
+一个 checkpoint ≈ **106 GB**（12 GB 权重 + ~94 GB DeepSpeed ZeRO-1 状态），
+默认 `save_every: 100`。长任务请用 `--save-every N` 拉长间隔，并靠
+`keep_last_n`（默认 2）自动只留最近几个：
+
+```bash
+# 等价写法：--keep-last N 或 --extra "keep_last_n=N"；0 = 全部保留
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
+  --save-every 2000 --keep-last 2
+```
+
+配额打满时会同时报 `Disk quota exceeded`（errno 122）、`tee: ...: Disk quota exceeded`，
+`df` 却仍显示有空闲（SFS Turbo 目录配额不体现在 `df` 里）。手工清理：
+
+```bash
+cd runs/<task>/<run_id>/checkpoints
+ls -d state/step_* | sort | head -n -1 | xargs -r rm -rf   # 留最新 state（--resume 用）
+ls weights/step_*.pt | sort | head -n -1 | xargs -r rm -f  # 留最新权重
+# 保存中断留下的 state/step_XXXXXX 是半截文件，不能续训，直接删
+```
+
+`train_custom.sh` 启动前会向 `<repo>/runs` 试写 `WRITE_PROBE_MB`（默认 64 MiB）探针，
+写不进去立即退出。详见 `docs/fastwam_train_zh.md` 第 11 节。
 
 > 生成的 data 配置默认使用：单相机不拼接、多相机水平拼接、每相机 224×224、
 > `delta_action_dim_mask` 全 `false`、`min/max` 归一化。动作维是否为 delta
@@ -411,6 +440,18 @@ runs/mydata_uncond_2cam224_1e-4/{run_id}/
     └── state/                       # 完整训练状态（断点续训用）
 ```
 
+直接调用 `train_zero1.sh` 时，保存策略与步数是 Hydra 覆盖（对应
+`train_custom.sh` 的同名选项）：
+
+```bash
+bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4 \
+  save_every=2000 keep_last_n=2      # 每 2000 步存一次，只留最近 2 个
+# 不清理旧 checkpoint：keep_last_n=0
+```
+
+每个 checkpoint ≈ 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），
+磁盘与配额的完整说明见「一键启动 → checkpoint 占用与磁盘清理」。
+
 > 提示：训练前可先用 `python scripts/dryrun_fastwam.py task=... ckpt=...`
 > 验证模型构建与推理链路（合成输入，不需要环境）。
 
@@ -518,7 +559,9 @@ python scripts/preprocess_action_dit_backbone.py \
 python scripts/precompute_text_embeds.py task=mydata_uncond_2cam224_1e-4
 
 # 3) 首次训练（自动生成 dataset_stats.json）
-bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4
+#    save_every/keep_last_n 控制 checkpoint 数量：每个约 106 GB，长任务务必设置
+bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4 \
+  save_every=2000 keep_last_n=2
 
 # 4) 推理（自定义环境按第 7.2 节；仿真按第 7.1 节）
 python examples/infer_custom.py \
@@ -720,6 +763,7 @@ bash scripts/train_custom.sh \
     --dry-run
 
 # 正式训练：与 dry-run 参数完全一致，去掉 --dry-run
+# 长任务再按需加：--save-every 2000 --keep-last 2
 ```
 
 > `train_custom.sh` 每次都会按 `--dataset / --camera / --action-feature` 重新生成

@@ -75,6 +75,19 @@ python experiments/robotwin/run_robotwin_manager.py ... MULTIRUN.num_gpus=4
 
 `run_libero_manager.py` 会校验 `CUDA_VISIBLE_DEVICES` 的数量，填 8 会直接报错。
 
+训练时还要注意输出目录的容量：一个 ZeRO-1 checkpoint 约 **106 GB**（权重 12 GB +
+optimizer state 约 94 GB），而 `runs/` 默认落在镜像挂进来的盘上。`configs/train.yaml`
+默认只保留最近 2 个（`keep_last_n: 2`），长任务建议再拉长保存间隔：
+
+```bash
+# 每 2000 步存一次、只留最近 2 个；总步数仍按 epoch 自动算
+bash scripts/train_zero1.sh 4 task=libero_uncond_2cam224_1e-4 \
+  save_every=2000 keep_last_n=2
+```
+
+配额写满时的报错是 `OSError: [Errno 122] Disk quota exceeded`（此时 `df` 仍显示有空间），
+清理与排查方法见 [fastwam_train_zh.md](fastwam_train_zh.md) 第 11 节。
+
 ---
 
 ## 5. 注意事项
