@@ -80,6 +80,10 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --dry-run
 # 固定总步数（0 = 恢复按 epoch 自动算）
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 --max-steps 20000
 
+# 显存不够：每卡 2 个样本 + 梯度累计 4（有效 batch = 2 × 8 卡 × 4 = 64）
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
+  --batch-size 2 --grad-accum 4
+
 # 长任务：拉长保存间隔 + 只留最近 2 个 checkpoint
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
   --save-every 2000 --keep-last 2
@@ -98,7 +102,8 @@ max_steps = ceil(样本数 / (batch_size × GPU 数 × gradient_accumulation_ste
 ```
 
 - `--epochs N`：改 epoch 数；
-- `--batch-size N`：改全局 batch（步数按比例减少，注意显存）；
+- `--batch-size N`：每卡 batch（每步样本数 = 该值 × 卡数 × 梯度累计；注意显存）；
+- `--grad-accum N`：梯度累计步数（显存不够时降 batch、用它把有效 batch 补回来）；
 - `--max-steps N`：直接给总步数，优先级高于 `--epochs`；`0` = 交还给 epoch 计算。
 
 `max_steps` 同时决定 cosine 调度器的总长度和 5% warmup，改步数后学习率曲线也会变。

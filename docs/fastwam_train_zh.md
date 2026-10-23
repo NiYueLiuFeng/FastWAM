@@ -116,6 +116,7 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 | `--gpus N` | 使用卡数（默认自动探测） |
 | `--model NAME` | `fastwam` / `fastwam_idm` / `fastwam_joint` / `fastwam_optional_idm` |
 | `--epochs N` / `--batch-size N` / `--lr LR` / `--num-workers N` / `--save-every N` | 训练超参 |
+| `--grad-accum N` | 梯度累计（`gradient_accumulation_steps`，别名 `--gradient-accumulation-steps`）；有效 batch = `batch-size × 卡数 × N`，见 10.5 |
 | `--max-steps N` | 固定总步数（`max_steps`）；默认 `null` = 按 `--epochs` 与样本数自动算，`0` = 恢复自动，见 10.5 |
 | `--keep-last N` | 只保留最近 N 个 checkpoint（`keep_last_n`，0 = 全留，见第 11 节） |
 | `--resume PATH` | 断点续训（目录或权重 `.pt`） |
@@ -398,7 +399,7 @@ torchrun --standalone --nproc_per_node=<gpus> scripts/precompute_text_embeds.py 
 3. 校验 `--dataset` / `--task` / `--task-file` / `--data-config` 恰好提供一个；
 4. 解析 GPU 数并校验可见性；
 5. 调 `generate` 或 `import-config` 得到 `TASK_NAME`；
-6. 把 `--epochs` / `--batch-size` / `--lr` / `--num-workers` / `--save-every` /
+6. 把 `--epochs` / `--batch-size` / `--grad-accum` / `--lr` / `--num-workers` / `--save-every` /
    `--resume` / `--norm-stats` / `--online-text-encode` 等转成覆盖项，经
    `override-form` 规范化为 `key=value` 或 `+key=value`；
 7. 调 `verify`，按退出码中止；`--dry-run` 用 `printf '%q'` 打印转义后的最终命令；
@@ -720,21 +721,22 @@ episode 长度只用于校验采样窗口，不会被写进配置。
 | `batch_size` | `2` | `:49` |
 | `num_workers` | `4` | `:50` |
 | `num_epochs` | `1` | `:51` |
-| `learning_rate` | `1e-4` | `:52` |
-| `save_every` | `100` | `:53` |
-| `keep_last_n` | `2`（只保留最近 2 个 checkpoint） | `:55` |
-| `max_steps` | `None`（按 epoch 与样本数自动算，见 10.5） | `:57` |
-| `resize` | `224 × 224` | `Policy` 定义 `:427` |
-| `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:428` 与 `merge_probes()` |
-| `global_sample_stride` | `1` | `:432` |
+| `gradient_accumulation_steps` | `1` | `:53` |
+| `learning_rate` | `1e-4` | `:54` |
+| `save_every` | `2000` | `:55` |
+| `keep_last_n` | `2`（只保留最近 2 个 checkpoint） | `:57` |
+| `max_steps` | `None`（按 epoch 与样本数自动算，见 10.5） | `:59` |
+| `resize` | `224 × 224` | `Policy` 定义 `:429` |
+| `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:430` 与 `merge_probes()` |
+| `global_sample_stride` | `1` | `:434` |
 | `delta_action_dim_mask` | 全 `false` | `parse_delta_mask()` |
-| `norm_default_mode` | `min/max` | `:436` |
-| `val_set_proportion` | `0.0` | `:437` |
+| `norm_default_mode` | `min/max` | `:440` |
+| `val_set_proportion` | `0.0` | `:441` |
 | `video_size` | 由 `resize` + 拼接方式计算（如 2 相机水平 → `[224, 448]`） | `merge_probes()` |
 | 文本缓存目录 | `./data/text_embeds_cache/autogen_<name>` | `merge_probes()` |
 
-argparse 的默认值定义在 `add_generate_arguments()`（`:1384`）；`build_policy()`（`:841`）
-把这些值装进 `Policy`；`render_data_yaml()`（`:765`）和 `render_task_yaml()`（`:773`）
+argparse 的默认值定义在 `add_generate_arguments()`（`:1390`）；`build_policy()`（`:844`）
+把这些值装进 `Policy`；`render_data_yaml()`（`:768`）和 `render_task_yaml()`（`:776`）
 负责写文件。
 
 ### 10.3 Hydra 基座配置提供的值
@@ -778,7 +780,7 @@ runs/<task>/<run_id>/config.yaml
 对应 `src/fastwam/runtime.py:462-464` 的
 `OmegaConf.to_container(cfg, resolve=True)` + `OmegaConf.save(...)`。
 
-### 10.5 训练步数：num_epochs / batch_size / max_steps
+### 10.5 训练步数：num_epochs / batch_size / gradient_accumulation_steps / max_steps
 
 `max_steps` 为 `null`（默认）时，训练器启动时按下式算总步数
 （`src/fastwam/trainer.py:230` `_estimate_total_train_steps()`）：
@@ -795,14 +797,20 @@ max_steps = ceil(样本数 / (batch_size × GPU 数 × gradient_accumulation_ste
 | 4 | 28267 |
 | 8 | 14134 |
 
-三个参数都能从命令行传：
+四个参数都能从命令行传：
 
 ```bash
 --epochs 3                      # 3 个 epoch -> 84801 步
 --batch-size 4                  # 4 卡时 -> 14134 步
+--grad-accum 2                  # 有效 batch 翻倍 -> 4 卡、batch 2 时 14134 步
 --max-steps 10000               # 直接给步数，忽略 epoch 计算
 --max-steps 0                   # 恢复自动（写回 max_steps: null）
 ```
+
+`batch_size` 是**每卡**的 micro-batch，`--grad-accum` 只降低优化器更新频率、不改变
+每次 forward 的显存占用；显存不够时降 `--batch-size`、再用 `--grad-accum` 把有效
+batch 补回来（例如 `--batch-size 2 --grad-accum 8` ≡ `--batch-size 8 --grad-accum 2`，
+4 卡时有效 batch 都是 64）。
 
 `--max-steps` 非空时优先于 `--epochs`。它会同时决定 cosine 调度器的总长度和
 5% warmup（`trainer.py:100-107`），改步数后学习率曲线的形状也会跟着变。

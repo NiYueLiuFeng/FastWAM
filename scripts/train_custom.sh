@@ -40,6 +40,7 @@ LR=""
 NUM_WORKERS=""
 SAVE_EVERY=""
 KEEP_LAST=""
+GRAD_ACCUM=""
 RESUME=""
 NORM_STATS=""
 BACKBONE=""
@@ -86,7 +87,8 @@ usage() {
   --gpus N                 使用卡数（默认：当前可见 GPU 数）
   --model NAME             fastwam / fastwam_idm / fastwam_joint / fastwam_optional_idm
   --epochs N, --batch-size N, --lr LR, --num-workers N, --save-every N
-  --max-steps N            固定总步数（默认 null：按 --epochs × 样本数/(batch×卡数) 自动算；0 = 恢复自动）
+  --grad-accum N           梯度累计步数（gradient_accumulation_steps；有效 batch = batch-size × 卡数 × N）
+  --max-steps N            固定总步数（默认 null：按 --epochs × 样本数/(batch×卡数×累计) 自动算；0 = 恢复自动）
   --keep-last N            只保留最近 N 个 checkpoint（默认取 configs/train.yaml，0 = 全留）
   --resume PATH            断点续训（目录或权重 .pt）
   --norm-stats PATH        data.train.pretrained_norm_stats
@@ -306,6 +308,13 @@ while [[ $# -gt 0 ]]; do
       KEEP_LAST="$2"
       shift 2
       ;;
+    --grad-accum|--gradient-accumulation-steps)
+      need_value "$@"
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) \
+        || die "--grad-accum 必须是 >= 1 的整数，实际为 $2"
+      GRAD_ACCUM="$2"
+      shift 2
+      ;;
     --resume)
       need_value "$@"
       RESUME="$(resolve_path "$2")"
@@ -475,6 +484,7 @@ if [[ -n "$MAX_STEPS" ]]; then
 fi
 if [[ -n "$SAVE_EVERY" ]]; then SETS+=("save_every=$SAVE_EVERY"); fi
 if [[ -n "$KEEP_LAST" ]]; then SETS+=("keep_last_n=$KEEP_LAST"); fi
+if [[ -n "$GRAD_ACCUM" ]]; then SETS+=("gradient_accumulation_steps=$GRAD_ACCUM"); fi
 if [[ -n "$RESUME" ]]; then SETS+=("resume=$RESUME"); fi
 if [[ -n "$NORM_STATS" ]]; then SETS+=("data.train.pretrained_norm_stats=$NORM_STATS"); fi
 if [[ -n "$BACKBONE" ]]; then SETS+=("model.action_dit_pretrained_path=$BACKBONE"); fi

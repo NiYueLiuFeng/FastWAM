@@ -49,6 +49,8 @@ DEFAULT_CONTEXT_LEN = 128
 DEFAULT_BATCH_SIZE = 2
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_EPOCHS = 1
+# 有效 batch = batch_size × 卡数 × gradient_accumulation_steps
+DEFAULT_GRAD_ACCUM = 1
 DEFAULT_LR = 1e-4
 DEFAULT_SAVE_EVERY = 2000
 # 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
@@ -444,6 +446,7 @@ class Policy:
     batch_size: int = DEFAULT_BATCH_SIZE
     num_workers: int = DEFAULT_NUM_WORKERS
     num_epochs: int = DEFAULT_EPOCHS
+    gradient_accumulation_steps: int = DEFAULT_GRAD_ACCUM
     learning_rate: float = DEFAULT_LR
     save_every: int = DEFAULT_SAVE_EVERY
     keep_last_n: int = DEFAULT_KEEP_LAST_N
@@ -790,7 +793,7 @@ def render_task_yaml(task_name: str, model: str, policy: Policy, datasets: Seque
         + f"save_every: {policy.save_every}\n"
         + f"keep_last_n: {policy.keep_last_n}\n"
         + "eval_every: 50\n"
-        + "gradient_accumulation_steps: 1\n"
+        + f"gradient_accumulation_steps: {policy.gradient_accumulation_steps}\n"
         + "weight_decay: 1.0e-2\n"
         + "resume: null\n"
     )
@@ -840,6 +843,8 @@ def write_config(path: Path, content: str, force: bool) -> str:
 
 def build_policy(args: argparse.Namespace) -> Policy:
     mask = args.delta_mask
+    if int(args.grad_accum) < 1:
+        die(f"--grad-accum 必须 >= 1，实际为 {args.grad_accum}")
     return Policy(
         name=args.name,
         camera_keys=list(args.camera or []),
@@ -864,6 +869,7 @@ def build_policy(args: argparse.Namespace) -> Policy:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         num_epochs=args.epochs,
+        gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         save_every=args.save_every,
         keep_last_n=args.keep_last,
@@ -1418,6 +1424,9 @@ def add_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--gradient-accumulation-steps", "--grad-accum", dest="grad_accum",
+                        type=int, default=DEFAULT_GRAD_ACCUM,
+                        help="gradient accumulation steps (effective batch = batch-size x GPUs x N)")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS,
                         help="fixed optimizer steps (0/unset = derive from --epochs and dataset size)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
