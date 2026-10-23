@@ -290,6 +290,47 @@ def read_episode_lengths(path: Path, version: str) -> list[int]:
         return []
 
 
+def check_parquet_columns(path: Path, features: dict[str, Any]) -> None:
+    """info.json 声明的列必须真的存在于 data parquet 里。
+
+    训练时的 v3 读取器直接用 `columns=list(features)` 选列，列名对不上就会在
+    `Dataset.from_parquet` 里抛 `ArrowInvalid: No match for FieldRef.Name(...)`，
+    而且是在模型加载完之后才炸，排查成本很高。这里提前拦住。
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError:
+        return  # 没有 pyarrow 时保持原来的行为
+
+    files = sorted((path / "data").glob("*/*.parquet"))
+    if not files:
+        files = sorted((path / "data").rglob("*.parquet"))
+    if not files:
+        return
+
+    try:
+        columns = set(pq.ParquetFile(files[0]).schema_arrow.names)
+    except Exception as exc:  # 损坏的 parquet 交给训练阶段报错
+        log(f"warning: 读取 {files[0]} 的列名失败: {exc}")
+        return
+
+    declared = {key for key, feature in features.items() if str(feature.get("dtype")) != "video"}
+    missing = sorted(declared - columns)
+    if not missing:
+        return
+
+    hint = ""
+    if "frame_index" in missing and "frame_idx" in columns:
+        hint = (
+            "\n  疑似列名不一致：meta 里是 `frame_index`，parquet 里是 `frame_idx`。"
+            f"\n  修复：python scripts/fix_dataset_columns.py --dataset {path} --write"
+        )
+    die(
+        f"{path}/meta/info.json 声明的列在 data parquet 中不存在: {missing}"
+        f"\n  parquet 现有列: {sorted(columns)}{hint}"
+    )
+
+
 def read_task_texts(path: Path) -> list[str]:
     """Read unique-free task strings from meta/tasks.jsonl or meta/tasks.parquet."""
     jsonl_path = path / "meta" / "tasks.jsonl"
@@ -352,6 +393,7 @@ def probe_dataset(
 
     action = parse_vector_specs(features, action_feature, "action", "--action-feature")
     state = parse_vector_specs(features, state_feature, "state", "--state-feature")
+    check_parquet_columns(path, features)
     lengths = read_episode_lengths(path, version)
 
     return Probe(

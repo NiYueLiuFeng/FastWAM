@@ -43,6 +43,21 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
    不会自动运行重任务**；
 5. 调用现有 `scripts/train_zero1.sh <gpus> task=autogen_<name> ...` 启动训练。
 
+正式训练时输出同时写终端和日志文件（`--dry-run` 不写）：
+
+```text
+<repo>/log/<yyyy-mm-dd>_<model>_<task>.log
+# 例：log/2026-10-23_fastwam_autogen_my_ds.log
+```
+
+- `<model>` 依次取 `--model`、`--extra "model=..."`、task 配置里的 `override /model:`；
+- 同一天、同模型、同任务再次运行会**追加**到同一文件，每次用 `=====` 分隔并记录
+  启动时间和完整命令；
+- 需要换目录用 `--log-dir PATH`（或环境变量 `LOG_DIR`），不需要日志用 `--no-log`；
+- 日志文件已被 `.gitignore` 的 `*.log` 忽略，不会误提交。
+
+训练产物（权重、`dataset_stats.json`）仍在 `runs/{task}/{run_id}/`，日志目录与之独立。
+
 常用选项：
 
 ```bash
@@ -187,6 +202,12 @@ data/my_dataset_v30/
 5. **分辨率**：原始图像分辨率任意（加载时会 resize），但最终 `video_size`
    （多相机拼接后）的 H、W 必须是 **16 的倍数**（VAE 要求）。
 6. 数据中每帧需带有 `task` 指令文本（LeRobot 标准字段）。
+7. **`meta/info.json` 的 `features` 必须与 `data/*.parquet` 的实际列名一致**。
+   训练读取器直接按 `features` 选列（`columns=list(features)`），列名对不上会在
+   构建数据集时报 `ArrowInvalid: No match for FieldRef.Name(frame_index)`。
+   常见的半成品数据是把 `frame_index` 写成了 `frame_idx`，用
+   `scripts/fix_dataset_columns.py --dataset <dir> --write` 原地改列名即可
+   （`train_custom.sh` 的前置检查也会提前拦下）。
 
 ### 2.3 语义约定（强烈建议）
 
@@ -475,6 +496,7 @@ python examples/infer_custom.py \
 | `num_frames-1 must be divisible by action_video_freq_ratio` | 自定义 `num_frames` / `action_video_freq_ratio` 不满足第 2.2 节的整除约束 |
 | `Concatenated image ... != video_size` | 推理时的相机 resize/拼接方式与训练不一致，对照第 7.2 节步骤 3 |
 | 首次训练很慢才开始 | 正在遍历数据集计算归一化统计（只发生一次），完成后写入 `dataset_stats.json` |
+| 启动后报 `ArrowInvalid: No match for FieldRef.Name(frame_index)` / `DatasetGenerationError` / `Error in call to target '...RobotVideoDataset'`，`full_key: data.train` | `meta/info.json` 声明了 `frame_index`，但 `data/*.parquet` 里这列叫 `frame_idx`（转换脚本版本不同留下的半成品）。先 `python scripts/fix_dataset_columns.py --dataset <dir>` 看计划，确认后加 `--write` 原地改列名；改完重新跑训练即可。`check_data_merge_train.py` 与 `train_custom.sh` 的前置检查都会报这个 |
 | 启动几十秒后报 `ncclUnhandledCudaError ... Cuda failure 2 'out of memory'`，落在 `data.train`（`Calculating dataset stats for normalization` 附近） | 卡上已有别的进程占显存，模型/梯度装不下。先 `nvidia-smi` 看空闲显存，换到空卡或等占用任务结束；本仓库的 `train_custom.sh` 会在启动前检查每张卡的空闲显存并直接报错（阈值 `MIN_FREE_GPU_MEM_GB`，默认 24，`--skip-prereq-check` 可跳过检查） |
 | 评测报找不到 `dataset_stats.json` | 显式传 `EVALUATION.dataset_stats_path`，或把该文件放在 checkpoint 同级/上级目录 |
 

@@ -16,6 +16,7 @@
 # Everything after `--` is forwarded verbatim as Hydra overrides.
 set -euo pipefail
 
+SCRIPT_ARGS=("$@")
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORIG_PWD="$(pwd)"
 PYTHON="${PYTHON:-python}"
@@ -46,6 +47,8 @@ RANDOM_BACKBONE=0
 SKIP_PREREQ=0
 DRY_RUN=0
 FORCE=0
+NO_LOG=0
+LOG_DIR="${LOG_DIR:-${REPO_ROOT}/log}"
 MIN_FREE_GPU_MEM_GB="${MIN_FREE_GPU_MEM_GB:-24}"
 
 usage() {
@@ -90,12 +93,18 @@ usage() {
   --skip-prereq-check      只做配置校验，不检查 backbone / 文本缓存 / 空闲显存
   --dry-run                打印最终训练命令后退出
   --force                  允许覆盖非自动生成的同名配置
+  --log-dir PATH           训练日志目录（默认 <repo>/log）
+  --no-log                 不写日志文件，只输出到终端
   --extra "k=v k=v"        追加 Hydra overrides（可用于覆盖上面的默认值）
   --                       其后的参数原样传给训练脚本
   -h, --help               显示本帮助
 
+  正式训练时输出同时写终端和日志文件：
+    <repo>/log/<yyyy-mm-dd>_<model>_<task>.log（同一天同名任务追加写，用 ==== 分隔）
+
 环境变量:
   MIN_FREE_GPU_MEM_GB      启动前要求每张卡的 idle 显存（GiB，默认 24；0 关闭检查）
+  LOG_DIR                  日志目录（等价于 --log-dir）
 EOF
 }
 
@@ -106,6 +115,32 @@ die() {
 
 resolve_path() {
   realpath -m -- "$1"
+}
+
+# Model name used in the log file name: --model wins, then a `model=...`
+# override (from --extra / `--`), then the `override /model:` line of the
+# generated task config.
+model_tag() {
+  local tag="$MODEL" item cfg
+  if [[ -z "$tag" ]]; then
+    for item in "${OVERRIDES[@]}"; do
+      [[ "$item" == model=* ]] && tag="${item#model=}"
+    done
+  fi
+  if [[ -z "$tag" ]]; then
+    cfg="${REPO_ROOT}/configs/task/${TASK_NAME}.yaml"
+    if [[ -f "$cfg" ]]; then
+      tag="$(sed -n -E \
+        's@^[[:space:]]*-[[:space:]]*override[[:space:]]*/model:[[:space:]]*([^[:space:]]+).*@\1@p' \
+        "$cfg" | head -n 1)"
+    fi
+  fi
+  printf '%s' "${tag:-unknown}"
+}
+
+# Keep the file name filesystem-safe without losing readability.
+path_tag() {
+  printf '%s' "$1" | tr '/ ' '--'
 }
 
 # Fail fast when the cards are already occupied by someone else. Without this,
@@ -249,6 +284,12 @@ while [[ $# -gt 0 ]]; do
     --skip-prereq-check) SKIP_PREREQ=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --force) FORCE=1; shift ;;
+    --no-log) NO_LOG=1; shift ;;
+    --log-dir)
+      need_value "$@"
+      LOG_DIR="$(resolve_path "$2")"
+      shift 2
+      ;;
     --zero)
       need_value "$@"
       [[ "$2" == "1" || "$2" == "2" ]] || die "--zero 只支持 1 或 2"
@@ -409,21 +450,58 @@ if (( ONLINE_TEXT )); then VERIFY_CMD+=(--online-text-encode); fi
 if (( RANDOM_BACKBONE )); then VERIFY_CMD+=(--random-backbone-init); fi
 if (( SKIP_PREREQ )); then VERIFY_CMD+=(--skip-prereq-check); fi
 
-status=0
-"${VERIFY_CMD[@]}" || status=$?
-if (( status != 0 )); then
+LAUNCH=("bash" "scripts/train_zero${ZERO}.sh" "$GPUS" "task=$TASK_NAME" "${OVERRIDES[@]}")
+
+# Prerequisite check, then either the dry-run banner or the real training.
+run() {
+  local status=0
+  "${VERIFY_CMD[@]}" || status=$?
+  (( status == 0 )) || return "$status"
+
+  if (( DRY_RUN )); then
+    echo "[dry-run] cd $REPO_ROOT"
+    printf '[dry-run]'
+    printf ' %q' "${LAUNCH[@]}"
+    printf '\n'
+    return 0
+  fi
+
+  echo "[train_custom] task=$TASK_NAME gpus=$GPUS zero=$ZERO" >&2
+  "${LAUNCH[@]}"
+}
+
+if (( DRY_RUN )); then
+  status=0
+  run || status=$?
   exit "$status"
 fi
 
-LAUNCH=("bash" "scripts/train_zero${ZERO}.sh" "$GPUS" "task=$TASK_NAME" "${OVERRIDES[@]}")
-
-if (( DRY_RUN )); then
-  echo "[dry-run] cd $REPO_ROOT"
-  printf '[dry-run]'
-  printf ' %q' "${LAUNCH[@]}"
-  printf '\n'
-  exit 0
+if (( NO_LOG )); then
+  status=0
+  run || status=$?
+  exit "$status"
 fi
 
-echo "[train_custom] task=$TASK_NAME gpus=$GPUS zero=$ZERO" >&2
-exec "${LAUNCH[@]}"
+# Log file: <repo>/log/<yyyy-mm-dd>_<model>_<task>.log. Same day + same
+# model + same task appends, so an earlier run of the day is never lost.
+mkdir -p "$LOG_DIR" || die "无法创建日志目录: $LOG_DIR"
+LOG_FILE="${LOG_DIR}/$(date +%Y-%m-%d)_$(model_tag)_$(path_tag "$TASK_NAME").log"
+{
+  echo "===== $(date '+%Y-%m-%d %H:%M:%S') train_custom ====="
+  echo "task:  $TASK_NAME"
+  echo "gpus:  $GPUS (zero=$ZERO)"
+  echo "repo:  $REPO_ROOT"
+  printf 'args:'
+  printf ' %q' "${SCRIPT_ARGS[@]}"
+  printf '\n'
+  printf 'cmd:'
+  printf ' %q' "${LAUNCH[@]}"
+  printf '\n'
+} >> "$LOG_FILE"
+echo "[train_custom] 日志: $LOG_FILE" >&2
+
+# Tee rather than `exec` so the terminal keeps behaving as before.
+set +e
+run 2>&1 | tee -a "$LOG_FILE"
+status=${PIPESTATUS[0]}
+exit "$status"

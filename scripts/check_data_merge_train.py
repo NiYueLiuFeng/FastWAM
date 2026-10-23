@@ -384,6 +384,25 @@ def probe_dataset(path: Path, args: argparse.Namespace) -> DatasetSummary:
         if "episode_index" not in columns:
             summary.problems.append("data parquet 缺少 `episode_index` 列")
 
+        # 训练读取器按 info.json 的 features 选列，缺任何一列都会在
+        # Dataset.from_parquet 里抛 ArrowInvalid。timestamp/episode_index
+        # 上面已有更具体的提示，这里只看其余的列。
+        declared = {
+            key for key, feature in features.items()
+            if str(feature.get("dtype")) != "video"
+        }
+        missing = sorted(declared - columns - {"timestamp", "episode_index"})
+        if missing:
+            hint = ""
+            if "frame_index" in missing and "frame_idx" in columns:
+                hint = (
+                    "（meta 里叫 frame_index、parquet 里叫 frame_idx；"
+                    "用 scripts/fix_dataset_columns.py --dataset ... --write 原地改名）"
+                )
+            summary.problems.append(
+                f"info.json 声明的列在 data parquet 中不存在: {missing}{hint}"
+            )
+
     return summary
 
 
