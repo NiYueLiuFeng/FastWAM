@@ -50,7 +50,7 @@ DEFAULT_BATCH_SIZE = 2
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_EPOCHS = 1
 DEFAULT_LR = 1e-4
-DEFAULT_SAVE_EVERY = 100
+DEFAULT_SAVE_EVERY = 2000
 # 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
 DEFAULT_KEEP_LAST_N = 2
 # None = 按 num_epochs 和样本数自动算总步数（见 fastwam/trainer.py:_estimate_total_train_steps）。
