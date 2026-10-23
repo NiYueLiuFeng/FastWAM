@@ -134,9 +134,39 @@ ls weights/step_*.pt | sort | head -n -1 | xargs -r rm -f  # 留最新权重
 `train_custom.sh` 启动前会向 `<repo>/runs` 试写 `WRITE_PROBE_MB`（默认 64 MiB）探针，
 写不进去立即退出。详见 `docs/fastwam_train_zh.md` 第 11 节。
 
+#### 使用 delta action（绝对动作 → 相对参考观测的偏移）
+
+数据集里存的是**绝对动作**（绝对 EEF 位姿、绝对关节角等），而控制器吃增量时，
+加 `--delta-action`：训练时选中的动作维减去参考观测，推理时再还原成绝对动作。
+
+```bash
+# 默认：位姿 6 维（0-5）转 delta，夹爪/力/力矩保持绝对值
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 4 --delta-action
+
+# 只转位置 3 维，旋转保持绝对
+bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 4 --delta-action-dims 0,1,2
+```
+
+- 参考帧默认 `first`：观测窗口的**当前帧**（`state[..., :1, :]`）。action 与
+  `observation.state` 的 `delta_timestamps` 都从当前帧开始，模型也只吃
+  `proprio[:, 0]`，所以这是训练/推理一致的基准；`--delta-action-base last` 改用
+  窗口末帧（与 `RelativePoseTransform` 的 `-1` 约定一致）。
+- 选中的维会自动写进 `delta_action_dim_mask`，padding 时间步的 delta 置零。
+- 归一化统计在 **delta 空间**重新计算：启用后不要复用旧的 `--norm-stats`
+  （旧的 `dataset_stats.json` 是按 absolute 动作算的）。
+- `--task` 模式（不重新生成配置）同样生效：脚本会追加
+  `+data.train.processor.delta_action_dims=[...]` 的 Hydra override。
+- 推理侧已经处理：`examples/infer_custom.py` 和 serving engine 会调用
+  transform 的 `backward`，把模型输出的 delta 还原成绝对动作再下发给机器人。
+
+> 注意：这是**逐维线性相减**。位置、关节角没问题；如果旋转维是 **Euler 角**，
+> 差值在 ±π 附近会回绕（wrap），不建议直接转 —— 要么只转位置维
+> （`--delta-action-dims 0,1,2`），要么先把旋转转成四元数 / rotation-6D 再训练。
+
 > 生成的 data 配置默认使用：单相机不拼接、多相机水平拼接、每相机 224×224、
-> `delta_action_dim_mask` 全 `false`、`min/max` 归一化。动作维是否为 delta
-> 无法从数据推断，需要时用 `--delta-mask` 显式指定。
+> `delta_action_dim_mask` 全 `false`、`delta_action_dims: null`（不做 delta 转换）、
+> `min/max` 归一化。动作维是否为 delta 无法从数据推断，需要时用 `--delta-mask`
+> 标注（仅 padding 置零）或用 `--delta-action` 真正做转换。
 >
 > `--help` 可查看全部参数。下面的 1–9 节是等价的手动流程，便于精细控制。
 
@@ -266,6 +296,8 @@ data/my_dataset_v30/
 
 - `action` 建议使用 **delta EEF pose + 绝对 gripper** 之类的组合，并在
   `delta_action_dim_mask` 中如实标注哪些维是 delta（用于 padding 置零）。
+- 如果数据是绝对动作、想训 delta 策略，用 `--delta-action` / `--delta-action-dims`
+  （见上文"使用 delta action"），它会在 processor 里自动挂 `RelativeActionTransform`。
 - 归一化统计（min/max 或 z-score）由训练首次运行自动计算，无需手工准备。
 
 ---

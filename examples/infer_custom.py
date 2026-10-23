@@ -112,12 +112,33 @@ def build_model_input(
     return x, proprio_norm
 
 
-def denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
+def denormalize_action(
+    action: torch.Tensor,
+    processor: FastWAMProcessor,
+    proprio: np.ndarray,
+) -> np.ndarray:
+    """Normalized model output -> absolute actions in the robot's action space."""
     action_key = processor.shape_meta["action"][0]["key"]
+    state_key = processor.shape_meta["state"][0]["key"]
     normalizer = processor.normalizer.normalizers["action"][action_key]
     if action.ndim == 2:
         action = action.unsqueeze(0)
-    return normalizer.backward(action.to(torch.float32, device="cpu")).numpy()
+    action = normalizer.backward(action.to(torch.float32, device="cpu"))
+
+    # Undo delta-action transforms (e.g. RelativeActionTransform): the model
+    # predicts offsets, the robot needs absolute targets.
+    if processor.action_state_transforms:
+        data = {
+            "action": {action_key: action},
+            "state": {
+                state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)
+            },
+        }
+        for trans in reversed(processor.action_state_transforms):
+            data = trans.backward(data)
+        action = data["action"][action_key]
+
+    return action.numpy()
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
@@ -160,7 +181,7 @@ def main(cfg: DictConfig):
                 negative_prompt="",
                 text_cfg_scale=1.0,
             )
-        action_chunk = denormalize_action(pred["action"], processor)[0]  # [action_horizon, D]
+        action_chunk = denormalize_action(pred["action"], processor, proprio)[0]  # [action_horizon, D]
 
         for action in action_chunk[:replan_steps]:
             obs = step_env(action)

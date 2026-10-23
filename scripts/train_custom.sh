@@ -41,6 +41,9 @@ NUM_WORKERS=""
 SAVE_EVERY=""
 KEEP_LAST=""
 GRAD_ACCUM=""
+DELTA_ACTION=0
+DELTA_ACTION_DIMS=""
+DELTA_ACTION_BASE=""
 RESUME=""
 NORM_STATS=""
 BACKBONE=""
@@ -78,6 +81,9 @@ usage() {
   --action-key KEY         action.<key> 子特征（可重复）
   --state-key KEY          observation.state.<key> 子特征（可重复）
   --delta-mask SPEC        true/false 逗号列表，或 all-false / all-true
+  --delta-action           训练 delta action：选中维度改为相对参考观测的偏移
+  --delta-action-dims LIST 要转换的 action 维度，逗号分隔（默认 0,1,2,3,4,5）
+  --delta-action-base B    参考帧 first（默认，当前观测 t0）/ last（观测窗口末帧）
   --norm-mode MODE         min/max（默认）或 z-score
   --val-proportion P       留出验证集比例（默认 0）
   --context-len N          文本编码长度（默认 128）
@@ -315,6 +321,27 @@ while [[ $# -gt 0 ]]; do
       GRAD_ACCUM="$2"
       shift 2
       ;;
+    --delta-action)
+      DELTA_ACTION=1
+      GEN_EXTRA+=("--delta-action")
+      shift
+      ;;
+    --delta-action-dims)
+      need_value "$@"
+      [[ "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+        || die "--delta-action-dims 格式应为逗号分隔的维度下标（如 0,1,2,3,4,5），实际为 $2"
+      DELTA_ACTION_DIMS="$2"
+      GEN_EXTRA+=("--delta-action-dims" "$2")
+      shift 2
+      ;;
+    --delta-action-base)
+      need_value "$@"
+      [[ "$2" == "last" || "$2" == "first" ]] \
+        || die "--delta-action-base 只支持 last 或 first，实际为 $2"
+      DELTA_ACTION_BASE="$2"
+      GEN_EXTRA+=("--delta-action-base" "$2")
+      shift 2
+      ;;
     --resume)
       need_value "$@"
       RESUME="$(resolve_path "$2")"
@@ -485,6 +512,15 @@ fi
 if [[ -n "$SAVE_EVERY" ]]; then SETS+=("save_every=$SAVE_EVERY"); fi
 if [[ -n "$KEEP_LAST" ]]; then SETS+=("keep_last_n=$KEEP_LAST"); fi
 if [[ -n "$GRAD_ACCUM" ]]; then SETS+=("gradient_accumulation_steps=$GRAD_ACCUM"); fi
+# Also works with --task (no regeneration): override-form adds the `+` prefix
+# when the generated data config predates delta_action_dims.
+if (( DELTA_ACTION )) && [[ -z "$DELTA_ACTION_DIMS" ]]; then
+  DELTA_ACTION_DIMS="0,1,2,3,4,5"
+fi
+if [[ -n "$DELTA_ACTION_DIMS" ]]; then
+  SETS+=("data.train.processor.delta_action_dims=[$DELTA_ACTION_DIMS]")
+  SETS+=("data.train.processor.delta_action_base=${DELTA_ACTION_BASE:-first}")
+fi
 if [[ -n "$RESUME" ]]; then SETS+=("resume=$RESUME"); fi
 if [[ -n "$NORM_STATS" ]]; then SETS+=("data.train.pretrained_norm_stats=$NORM_STATS"); fi
 if [[ -n "$BACKBONE" ]]; then SETS+=("model.action_dit_pretrained_path=$BACKBONE"); fi

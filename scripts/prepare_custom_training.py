@@ -57,6 +57,12 @@ DEFAULT_SAVE_EVERY = 2000
 DEFAULT_KEEP_LAST_N = 2
 # None = 按 num_epochs 和样本数自动算总步数（见 fastwam/trainer.py:_estimate_total_train_steps）。
 DEFAULT_MAX_STEPS: int | None = None
+# delta-action 默认只转换位姿 6 维（x, y, z, rot_a, rot_b, rot_c）；
+# 夹爪宽度、力/力矩保持绝对值。
+DEFAULT_DELTA_ACTION_DIMS = "0,1,2,3,4,5"
+# action 与 observation.state 的 delta_timestamps 都从当前帧 0 开始，
+# 模型训练/推理也只用 proprio[:, 0]，所以参考帧默认取观测窗口的第一帧。
+DEFAULT_DELTA_ACTION_BASE = "first"
 
 _SENTINEL = object()
 
@@ -437,6 +443,8 @@ class Policy:
     action_keys: list[str] = field(default_factory=list)
     state_keys: list[str] = field(default_factory=list)
     delta_mask: str | None = None
+    delta_action_dims: str | None = None
+    delta_action_base: str = DEFAULT_DELTA_ACTION_BASE
     norm_mode: str = "min/max"
     val_proportion: float = 0.0
     context_len: int = DEFAULT_CONTEXT_LEN
@@ -465,6 +473,7 @@ class Plan:
     video_size: tuple[int, int]
     concat: str | None
     delta_masks: list[bool]
+    delta_action_dims: list[int]
     policy: Policy
     max_episode_length: int | None
 
@@ -532,6 +541,10 @@ def merge_probes(probes: Sequence[Probe], policy: Policy) -> Plan:
 
     action_dim = sum(spec.dim for spec in action)
     delta_masks = parse_delta_mask(policy.delta_mask, action)
+    delta_action_dims = parse_delta_action_dims(policy.delta_action_dims, action)
+    # Delta dims always carry the pad mask: padded steps must stay at 0 delta.
+    for index in delta_action_dims:
+        delta_masks[index] = True
 
     resize_h, resize_w = policy.resize
     concat = policy.concat
@@ -583,6 +596,7 @@ def merge_probes(probes: Sequence[Probe], policy: Policy) -> Plan:
         video_size=video_size,
         concat=concat,
         delta_masks=delta_masks,
+        delta_action_dims=delta_action_dims,
         policy=policy,
         max_episode_length=max_length,
     )
@@ -609,6 +623,34 @@ def parse_delta_mask(raw: str | None, action: list[VectorSpec]) -> list[bool]:
     if len(values) != total:
         die(f"--delta-mask 长度 {len(values)} 与 action 维度 {total} 不一致")
     return values
+
+
+def parse_delta_action_dims(raw: str | None, action: list[VectorSpec]) -> list[int]:
+    """Parse ``--delta-action-dims`` into absolute indices over the action vector."""
+    total = sum(spec.dim for spec in action)
+    if raw is None:
+        return []
+    text = raw.strip().lower()
+    if text in {"", "none", "false", "null"}:
+        return []
+    if text in {"all", "true"}:
+        return list(range(total))
+    indices = []
+    for part in (item.strip() for item in text.split(",")):
+        if not part:
+            continue
+        try:
+            index = int(part)
+        except ValueError:
+            die(f"无法解析 --delta-action-dims 项: {part!r}")
+        if not 0 <= index < total:
+            die(f"--delta-action-dims 下标 {index} 超出 action 维度 {total}")
+        indices.append(index)
+    if not indices:
+        die("--delta-action-dims 为空；如需关闭 delta-action 请省略该参数")
+    if len(set(indices)) != len(indices):
+        die(f"--delta-action-dims 有重复下标: {indices}")
+    return sorted(indices)
 
 
 def validate_policy(
@@ -745,6 +787,13 @@ def _render_data_node(plan: Plan, node: str, is_val: bool) -> list[str]:
         mask = plan.delta_masks[offset:offset + spec.dim]
         offset += spec.dim
         lines.append(f"      {spec.key}: {_bool_list(mask)}")
+    # Always emitted so `data.train.processor.delta_action_dims=...` can be
+    # overridden at launch time without Hydra's `+` prefix.
+    lines.append(
+        "    delta_action_dims: "
+        + (_int_list(plan.delta_action_dims) if plan.delta_action_dims else "null")
+    )
+    lines.append(f"    delta_action_base: {_yaml_str(policy.delta_action_base)}")
     lines.extend([
         "    action_state_transforms: null",
         "    use_stepwise_action_norm: false",
@@ -845,6 +894,9 @@ def build_policy(args: argparse.Namespace) -> Policy:
     mask = args.delta_mask
     if int(args.grad_accum) < 1:
         die(f"--grad-accum 必须 >= 1，实际为 {args.grad_accum}")
+    delta_dims = args.delta_action_dims
+    if delta_dims is None and args.delta_action:
+        delta_dims = DEFAULT_DELTA_ACTION_DIMS
     return Policy(
         name=args.name,
         camera_keys=list(args.camera or []),
@@ -861,6 +913,8 @@ def build_policy(args: argparse.Namespace) -> Policy:
         action_keys=list(args.action_key or []),
         state_keys=list(args.state_key or []),
         delta_mask=mask,
+        delta_action_dims=delta_dims,
+        delta_action_base=args.delta_action_base,
         norm_mode=args.norm_mode,
         val_proportion=args.val_proportion,
         context_len=args.context_len,
@@ -1416,6 +1470,16 @@ def add_generate_arguments(parser: argparse.ArgumentParser) -> None:
                         help="select <state-feature>.<key> sub-features (repeatable)")
     parser.add_argument("--delta-mask", default=None,
                         help="comma-separated true/false per action dim, or all-false/all-true")
+    parser.add_argument("--delta-action", action="store_true",
+                        help="train on delta actions: the selected dims become offsets from the "
+                             f"reference observation (default dims: {DEFAULT_DELTA_ACTION_DIMS})")
+    parser.add_argument("--delta-action-dims", default=None, metavar="LIST",
+                        help="comma-separated action dims to convert, or `all` "
+                             f"(implies --delta-action; default: {DEFAULT_DELTA_ACTION_DIMS})")
+    parser.add_argument("--delta-action-base", choices=["first", "last"],
+                        default=DEFAULT_DELTA_ACTION_BASE,
+                        help="reference observation frame for delta actions: `first` = the "
+                             "current observation (default), `last` = end of the obs window")
     parser.add_argument("--norm-mode", choices=["min/max", "z-score"], default="min/max")
     parser.add_argument("--val-proportion", type=float, default=0.0)
     parser.add_argument("--context-len", type=int, default=DEFAULT_CONTEXT_LEN)

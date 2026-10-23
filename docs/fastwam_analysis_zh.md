@@ -16,7 +16,7 @@
 | 输入 | 多相机 RGB 视频（33 帧 obs → 抽 9 帧送 VAE）、动作序列（32 步）、本体状态（只用第 0 帧）、文本指令（T5 embedding + 1 个 proprio token）。 |
 | 输出 | 两路 flow-matching 速度场：视频 latent 速度 `[B,48,T_lat,H/16,W/16]` 和动作速度 `[B,32,action_dim]`。推理时只取动作，或先用视频专家"想象未来"再出动作（IDM）。 |
 | 训练阶段 | **单阶段端到端**。一次 forward 同时算视频 loss + 动作 loss。没有"先训视频再训动作"的分阶段训练。Optional-IDM 也是在**同一次训练**里随机切换两种注意力掩码来同时支持两种推理模式。 |
-| delta / absolute | **框架不强制、也不自动转换**。训练用的就是数据集里 `action` 列（经过可选 `action_state_transforms` 和归一化）。官方 LIBERO 数据是 **delta EEF pose + 绝对 gripper**；RoboTwin 是 **绝对关节角 qpos**。想让绝对位姿变 delta，需要在 `action_state_transforms` 里显式配 `RelativePoseTransform`。 |
+| delta / absolute | **框架不强制、也不自动转换**。训练用的就是数据集里 `action` 列（经过可选 `action_state_transforms` 和归一化）。官方 LIBERO 数据是 **delta EEF pose + 绝对 gripper**；RoboTwin 是 **绝对关节角 qpos**。想让绝对动作变 delta：`train_custom.sh --delta-action[-dims ...]`（生成 `delta_action_dims`，processor 自动挂 `RelativeActionTransform`），或手动在 `action_state_transforms` 里配 `RelativePoseTransform` / `RelativeJointTransform`。 |
 
 ---
 
@@ -204,14 +204,15 @@ FastWAM 在 Wan2.2-TI2V-5B 的 DiT 旁边并联了一个动作专家 ActionDiT�
 `FastWAMProcessor`（`fastwam_processor.py:14`）：
 
 1. **图像**：每路相机 resize（保持长宽比）+ center crop → 多相机拼接（`horizontal` / `vertical` / `robotwin`）→ 归一化到 `[-1,1]`
-2. **动作**（严格按以下顺序，`fastwam_processor.py:244-263`）：
-   1. **padding 维置零**：`delta_action_dim_mask` 标记为 delta 的维度，在 `action_is_pad` 的位置置 0。**注意：这不是 absolute→delta 的转换，只是把 padding 处的 delta 置零**
-   2. 可选的 `action_state_transforms`（例如 delta/absolute 互转，见 §5）
+2. **动作**（严格按以下顺序，`fastwam_processor.py:349-365`）：
+   1. 可选的 `action_state_transforms`（例如 delta/absolute 互转，见 §5；`delta_action_dims`
+      会自动在队首插入 `RelativeActionTransform`）
+   2. **padding 维置零**：`delta_action_dim_mask` 标记为 delta 的维度，在 `action_is_pad` 的位置置 0。**注意：这不是 absolute→delta 的转换，只是把 padding 处的 delta 置零**；放在 transform 之后，是因为 padding 的绝对动作转成 delta 后并不是 0，必须在 delta 空间置零
    3. 归一化：`LinearNormalizer`，LIBERO 用 `min/max`，RoboTwin 用 `z-score`，结果 clamp 到 `[-5,5]`
    4. `ConcatLeftAlign` 按 `*_dim_is_pad` 拼成目标维数
 3. **文本**：`DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"`，按 SHA-256 读缓存 embedding；缓存里的 mask 用于把无效位置清零，随后 `context_mask` 被设成**全 1**（与 Wan2.2 行为一致）
 
-`postprocess`（`fastwam_processor.py:286`）是逆过程：反拼接 → 反归一化 → 逆 transform → 按 `start_obs_step = num_obs_steps - 1` 切片（推理时 `num_obs_steps=1`，等价于不切）。
+`postprocess`（`fastwam_processor.py:385`）是逆过程：反拼接 → 反归一化 → 逆 transform → 按 `start_obs_step = num_obs_steps - 1` 切片（推理时 `num_obs_steps=1`，等价于不切）。
 
 ### 2.4 一个训练 batch 的实际形状
 
@@ -494,7 +495,7 @@ infer_action 输出（归一化）
 这是最容易误解的地方：
 
 - `FastWAMProcessor.preprocess` **不会**把绝对动作转成 delta，也不会反过来。
-- `delta_action_dim_mask` 的名字很有迷惑性，但它只做一件事：**把 padding 时间步上"属于 delta 的维度"置 0**（`fastwam_processor.py:244-262`）：
+- `delta_action_dim_mask` 的名字很有迷惑性，但它只做一件事：**把 padding 时间步上"属于 delta 的维度"置 0**（`fastwam_processor.py:350-362`）：
 
 ```python
 pad_delta_mask = cur_action_is_pad.unsqueeze(1) & cur_dim_mask.unsqueeze(0)
@@ -506,8 +507,13 @@ cur_action[pad_delta_mask] = 0.0
 - 真正做 absolute→delta 的是 `src/fastwam/datasets/lerobot/transforms/relative_action.py`：
   - `RelativePoseTransform`（12 行）：`relative = inv(base_pose) @ pose_matrix`，base 取 `state[..., -1:, :]`（当前 EEF 位姿）
   - `RelativeJointTransform`（84 行）：`relative = action - state[..., :1, :]`（减去首帧关节角）
+  - `RelativeActionTransform`（新增）：按**维度下标**做线性相减，`dims` 可选、
+    `base_frame` 默认 `first`（当前观测）/ 可切 `last`，不要求四元数格式，
+    适合任意 13 维混合动作向量（位置 + Euler + gripper + 六维力）
 
-  这两个 transform 必须通过 `action_state_transforms` 显式配置才会生效。
+  这三个 transform 必须通过 `action_state_transforms` 显式配置才会生效；
+  `prepare_custom_training.py --delta-action[-dims ...]` 会生成
+  `delta_action_dims`，由 `FastWAMProcessor` 自动前置一个 `RelativeActionTransform`。
 
 - **当前所有官方配置的 `action_state_transforms` 都是 `null`**（LIBERO、RoboTwin 都是）。也就是说：**训练直接用数据集里 `action` 列的原始语义**。
 
@@ -534,13 +540,19 @@ cur_action[pad_delta_mask] = 0.0
 | 已经是 delta EEF / delta joint | `action_state_transforms: null`，在 `delta_action_dim_mask` 里如实标注哪些维是 delta（只为 padding 置零） |
 | 绝对 EEF 位姿，想训 delta 策略 | `action_state_transforms` 配 `RelativePoseTransform` |
 | 绝对关节角，想训 delta joint | 配 `RelativeJointTransform` |
+| 任意混合动作向量（如 13 维：位姿 + gripper + 力/力矩） | `--delta-action` / `--delta-action-dims`，只转换需要的维 |
 | 绝对关节角，直接端到端 | 像 RoboTwin 一样不配 transform，用 `z-score` 归一化 |
 
 使用 `RelativePoseTransform` 前需要确认三件事：
 
 1. **位姿格式必须是 7 维 `[x, y, z, qx, qy, qz, qw]`**（位置 + 四元数），不是 LIBERO/OpenVLA 常见的 `xyz + axis-angle`。它内部会转成 4×4 齐次矩阵再求逆。
 2. **它取 `state[..., -1:, :]` 作为基准**。单步推理时 `state` 只有 1 帧，`-1` 就是当前状态；但训练时 `state` 是整段 33 帧观测，`-1` 会是**最后一个观测**而不是 t0。如果你要严格"以 t0 为基准"的 delta，需要把这里改成 `state[..., :1, :]`（`RelativeJointTransform` 就是这么做的）。
-3. **transform 在归一化之前执行**。`FastWAMProcessor.postprocess` 是逆序还原（反拼接 → 反归一化 → 逆 transform → 按 `num_obs_steps` 切片），但要注意：`experiments/libero/eval_libero_single.py`（`_denormalize_action`）和 `examples/infer_custom.py`（`denormalize_action`）**只调用了 `normalizer.backward`，不会逆 transform**。如果你启用了 `RelativePoseTransform` / `RelativeJointTransform`，这两条推理路径需要自己补上 `postprocess` 或手动 `trans.backward`，否则会拿 delta 当绝对动作执行。
+3. **transform 在归一化之前执行**。`FastWAMProcessor.postprocess` 是逆序还原（反拼接 → 反归一化 → 逆 transform → 按 `num_obs_steps` 切片）。推理路径的状态：
+   - `examples/infer_custom.py`（`denormalize_action`）和 `src/fastwam/serving/engine.py`
+     （`_denormalize_action`）现在都会在反归一化后**逆序调用 `trans.backward`**；
+   - `experiments/libero/eval_libero_single.py` 仍然**只反归一化、不逆 transform**，
+     启用 delta 转换后需要自己补；
+   - `trainer.evaluate()` 的 pred/GT 都在 transform 后的空间里比较，不需要还原。
 
 > 关键结论：**模型对 delta / absolute 没有偏好，也不会自动识别。** 你喂什么，它就学什么；推理输出也必须按同样的语义去执行。选哪种取决于你的控制器（OSC 增量位姿 vs 绝对关节位置）和数据质量。经验上：
 > - **delta 位姿 + 绝对 gripper** 对跨本体、跨场景更稳（RoboTwin/LIBERO 主流做法）
@@ -632,9 +644,9 @@ flowchart TD
     B --> C[RobotVideoDataset<br/>33 帧 obs / 32 步 action / 9 帧视频]
     C --> D[FastWAMProcessor.preprocess]
     D --> D1[图像 resize+crop+concat+归一化]
-    D --> D3[padding 维置零<br/>delta_action_dim_mask]
-    D3 --> D2[action_state_transforms<br/>可选 delta 转换]
-    D2 --> D4[LinearNormalizer<br/>min/max 或 z-score]
+    D --> D2[action_state_transforms<br/>可选 delta 转换]
+    D2 --> D3[padding 维置零<br/>delta_action_dim_mask]
+    D3 --> D4[LinearNormalizer<br/>min/max 或 z-score]
     D4 --> D5[ConcatLeftAlign 拼接]
     D1 --> E[sample]
     D5 --> E
@@ -831,10 +843,15 @@ MoT（Mixture-of-Transformers）双专家并联：
 - LIBERO：**delta EEF pose（6 维）+ 绝对 gripper（1 维）**
 - RoboTwin：**绝对关节角 qpos（14 维）**
 - `delta_action_dim_mask` **只用于 padding 置零**，不是 delta 转换开关
-- 真正转换在 `RelativePoseTransform` / `RelativeJointTransform`，且所有官方配置都是 `action_state_transforms: null`
+- 真正转换在 `RelativePoseTransform` / `RelativeJointTransform` / `RelativeActionTransform`，
+  且所有官方配置都是 `action_state_transforms: null`
 
 三个容易踩的细节：
 
-1. `RelativePoseTransform` 要求 **7 维位置+四元数**（不是 axis-angle）
-2. 它训练时用 `state[..., -1:, :]` 作基准，取到的是**最后一个观测**而非 t0
-3. LIBERO 评测和 `examples/infer_custom.py` **只反归一化、不逆 transform**，启用 delta 转换后需自己补
+1. `RelativePoseTransform` 要求 **7 维位置+四元数**（不是 axis-angle）；
+   `RelativeActionTransform` 不要求格式，但只是逐维线性相减，Euler 旋转差在 ±π 附近会回绕
+2. `RelativePoseTransform` 训练时 base 取 `state[..., -1:, :]`（窗口**末帧**）；
+   `RelativeActionTransform` 默认 `base_frame: first`（`state[0]`，与 `proprio[:, 0]`
+   和 action 的 delta_timestamps 对齐），`last` 才与 `RelativePoseTransform` 一致
+3. `experiments/libero/eval_libero_single.py` **只反归一化、不逆 transform**，启用
+   delta 转换后需自己补；`examples/infer_custom.py` 和 serving engine 已经会逆 transform

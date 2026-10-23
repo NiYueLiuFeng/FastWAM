@@ -43,6 +43,8 @@ train:
     proprio_output_dim: 13
     delta_action_dim_mask:
       default: [false, false, false, false, false, false, false, false, false, false, false, false, false]
+    delta_action_dims: null
+    delta_action_base: 'first'
     action_state_transforms: null
     use_stepwise_action_norm: false
     norm_default_mode: 'min/max'

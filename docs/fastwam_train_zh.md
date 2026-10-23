@@ -103,7 +103,10 @@ bash scripts/train_custom.sh --data-config /path/to/my_data.yaml --gpus 4
 | `--global-sample-stride N` | 默认 `1` |
 | `--action-key KEY` | 选 `action.<key>` 子特征（可重复） |
 | `--state-key KEY` | 选 `observation.state.<key>` 子特征（可重复） |
-| `--delta-mask SPEC` | `true/false` 逗号列表，或 `all-false` / `all-true` |
+| `--delta-mask SPEC` | `true/false` 逗号列表，或 `all-false` / `all-true`（只用于 padding 置零） |
+| `--delta-action` | 训练 delta action：选中维度改为相对参考观测的偏移（默认前 6 维） |
+| `--delta-action-dims LIST` | 要转换的动作维，逗号分隔；`all` = 全部。默认 `0,1,2,3,4,5` |
+| `--delta-action-base {first,last}` | 参考观测帧，默认 `first`（当前观测 `state[0]`）；`last` 用窗口末帧 |
 | `--norm-mode MODE` | `min/max`（默认）或 `z-score` |
 | `--val-proportion P` | 留出验证集比例，默认 `0` |
 | `--context-len N` | 文本编码长度，默认 `128` |
@@ -217,6 +220,7 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
 | 拼接 | 单相机不拼接；多相机 `horizontal` |
 | `video_size` | 单相机 `[224, 224]`；水平拼接 `[224, 224*N]` |
 | `delta_action_dim_mask` | 全 `false`（delta 语义无法从数据推断） |
+| `delta_action_dims` | `null`（不转换）；指定后由 processor 自动套 `RelativeActionTransform` |
 | 归一化 | `min/max` |
 | 文本缓存 | `./data/text_embeds_cache/autogen_<name>`，`context_len=128` |
 | 训练超参 | `batch_size=2`、`num_workers=4`、`num_epochs=1`、`lr=1e-4`、`save_every=100`、`keep_last_n=2` |
@@ -270,6 +274,8 @@ train:
     proprio_output_dim: 8
     delta_action_dim_mask:
       default: [false, false, false, false, false, false, false]
+    delta_action_dims: null
+    delta_action_base: 'last'
     action_state_transforms: null
     use_stepwise_action_norm: false
     norm_default_mode: 'min/max'
@@ -729,15 +735,20 @@ episode 长度只用于校验采样窗口，不会被写进配置。
 | `resize` | `224 × 224` | `Policy` 定义 `:429` |
 | `concat` | `auto`（单相机 `null`，多相机 `horizontal`） | `:430` 与 `merge_probes()` |
 | `global_sample_stride` | `1` | `:434` |
-| `delta_action_dim_mask` | 全 `false` | `parse_delta_mask()` |
+| `delta_action_dim_mask` | 全 `false`（delta 维强制为 `true`） | `parse_delta_mask()` `:603` |
+| `delta_action_dims` | `null`（不转换） | `DEFAULT_DELTA_ACTION_DIMS` `:62` |
+| `delta_action_base` | `first`（当前观测；`last` 与 `RelativePoseTransform` 一致） | `DEFAULT_DELTA_ACTION_BASE` `:65` |
 | `norm_default_mode` | `min/max` | `:440` |
 | `val_set_proportion` | `0.0` | `:441` |
 | `video_size` | 由 `resize` + 拼接方式计算（如 2 相机水平 → `[224, 448]`） | `merge_probes()` |
 | 文本缓存目录 | `./data/text_embeds_cache/autogen_<name>` | `merge_probes()` |
 
-argparse 的默认值定义在 `add_generate_arguments()`（`:1390`）；`build_policy()`（`:844`）
-把这些值装进 `Policy`；`render_data_yaml()`（`:768`）和 `render_task_yaml()`（`:776`）
-负责写文件。
+argparse 的默认值定义在 `add_generate_arguments()`（`:1442`）；`build_policy()`（`:891`）
+把这些值装进 `Policy`（`Policy` 定义在 `:428`）；`render_data_yaml()`（`:815`）和
+`render_task_yaml()`（`:823`）负责写文件。
+
+`--delta-action-dims` 由 `parse_delta_action_dims()`（`:626`）解析，生成的
+`delta_action_dims` 会同时把对应维写进 `delta_action_dim_mask`（padding 处置零）。
 
 ### 10.3 Hydra 基座配置提供的值
 

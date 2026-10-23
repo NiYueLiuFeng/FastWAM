@@ -325,8 +325,15 @@ class InferenceEngine:
 
     # ----------------------------------------------------------- postprocessing
 
-    def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
-        """``action`` is [T, action_dim] on CPU, still normalized."""
+    def _denormalize_action(
+        self, action: torch.Tensor, state: list[float] | None = None
+    ) -> np.ndarray:
+        """``action`` is [T, action_dim] on CPU, still normalized.
+
+        When the processor carries action transforms (e.g. delta actions), they
+        are inverted with the *raw* ``state`` so the caller receives absolute
+        actions, not offsets.
+        """
         if self.sc.dry_run:
             return action.to(torch.float32).numpy()
 
@@ -340,7 +347,35 @@ class InferenceEngine:
             parts.append(normalizer.backward(x[:, :, offset : offset + dim]))
             offset += dim
         merged = torch.cat(parts, dim=-1)[0]
+        if state is not None and self.processor.action_state_transforms:
+            merged = self._invert_action_transforms(merged, state)
         return merged.numpy()
+
+    def _invert_action_transforms(
+        self, action: torch.Tensor, state: list[float]
+    ) -> torch.Tensor:
+        arr = np.asarray(state, dtype=np.float32)
+        batch: dict[str, dict[str, torch.Tensor]] = {"action": {}, "state": {}}
+        offset = 0
+        for meta in self.shape_meta["action"]:
+            dim = int(meta["shape"])
+            key = str(meta["key"])
+            batch["action"][key] = action[:, offset : offset + dim].unsqueeze(0)
+            offset += dim
+        offset = 0
+        for meta in self.shape_meta["state"]:
+            dim = int(meta["raw_shape"])
+            key = str(meta["key"])
+            batch["state"][key] = torch.as_tensor(
+                arr[offset : offset + dim], dtype=torch.float32
+            ).unsqueeze(0)
+            offset += dim
+        for trans in reversed(self.processor.action_state_transforms):
+            batch = trans.backward(batch)
+        return torch.cat(
+            [batch["action"][str(m["key"])][0] for m in self.shape_meta["action"]],
+            dim=-1,
+        )
 
     # ------------------------------------------------------------------ prompt
 
@@ -448,7 +483,7 @@ class InferenceEngine:
         infer_ms = (time.perf_counter() - infer_start) * 1000.0
 
         post_start = time.perf_counter()
-        actions = self._denormalize_action(action)
+        actions = self._denormalize_action(action, request.state)
         postprocess_ms = (time.perf_counter() - post_start) * 1000.0
 
         timing = {
