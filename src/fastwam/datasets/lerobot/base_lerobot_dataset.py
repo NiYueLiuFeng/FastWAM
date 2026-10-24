@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from pathlib import Path
@@ -13,6 +14,15 @@ from .processors.base_processor import BaseProcessor
 logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
+
+
+def _stats_all_reduce_device() -> torch.device:
+    """Device for the stats all_reduce: NCCL needs CUDA tensors, gloo needs CPU ones."""
+    if torch.distributed.get_backend() == "nccl":
+        local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+        if torch.cuda.is_available() and local_rank < torch.cuda.device_count():
+            return torch.device("cuda", local_rank)
+    return torch.device("cpu")
 
 
 def _resolve_lerobot_key(meta: Dict[str, Any], standard_key: str, default_key: str) -> str:
@@ -277,129 +287,155 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             self.processor.eval()
         return self
 
-    def get_dataset_stats(self, preprocessor: BaseProcessor):
-        state_min = DefaultDict(list)
-        state_max = DefaultDict(list)
-        state_mean = DefaultDict(list)
-        state_var = DefaultDict(list)
-        state_q01 = DefaultDict(list)
-        state_q99 = DefaultDict(list)
+    def get_dataset_stats(self, preprocessor: BaseProcessor, rank: int = 0, world_size: int = 1):
+        """Compute normalization statistics over all episodes.
 
-        action_min = DefaultDict(list)
-        action_max = DefaultDict(list)
-        action_mean = DefaultDict(list)
-        action_var = DefaultDict(list)
-        action_q01 = DefaultDict(list)
-        action_q99 = DefaultDict(list)
-
+        With `world_size > 1` the episodes are sharded round-robin across ranks and
+        the partial aggregates are combined with one all_reduce, so every rank ends
+        up with the same stats and wall time drops roughly `world_size` times.
+        Min / max / quantiles are combined with MIN / MAX; per-episode mean and
+        variance are combined with SUM and turned into mean / std afterwards, which
+        is exactly equivalent to the single-process result.
+        """
         episodes_num = self.multi_dataset.num_episodes
-        
+        if world_size > episodes_num:
+            rank, world_size = 0, 1
+
+        # (group, key, stat) -> per-episode tensors, for min / max / q01 / q99
+        extremes = DefaultDict(list)
+        # (group, key, stat) -> float64 sum over the local episodes, for mean / var / mean**2
+        sums = {}
+
         def process_episode(episode_idx):
-            batch = self._get_episode_data(episode_idx) 
+            batch = self._get_episode_data(episode_idx)
             batch = preprocessor.action_state_transform(batch)
             return batch
-        
-        multi_thread = True
-        if not multi_thread:
-            for episode_idx in tqdm(range(episodes_num), desc="Iterating dataset to get normalization"):
-                batch = process_episode(episode_idx)
+
+        def accumulate(group, meta, cur: torch.Tensor):
+            key = meta["key"]
+            extremes[(group, key, "min")].append(cur.amin(0))
+            extremes[(group, key, "max")].append(cur.amax(0))
+            extremes[(group, key, "q01")].append(torch.quantile(cur, 0.01, dim=0, keepdim=False))
+            extremes[(group, key, "q99")].append(torch.quantile(cur, 0.99, dim=0, keepdim=False))
+            # equal weight per episode, matching the single-process reduction
+            mean = cur.mean(0).double()
+            for name, value in (("mean", mean), ("var", cur.var(0).double()), ("sq", mean * mean)):
+                prev = sums.get((group, key, name))
+                sums[(group, key, name)] = value.clone() if prev is None else prev + value
+
+        local_indices = list(range(rank, episodes_num, world_size))
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_episode, num) for num in local_indices]
+            progress = tqdm(
+                as_completed(futures),
+                total=len(local_indices),
+                desc=f"Iterating dataset to get normalization (rank {rank}/{world_size}: {len(local_indices)} of {episodes_num} episodes)",
+                disable=world_size > 1 and rank != 0,
+            )
+            for future in progress:
+                try:
+                    batch = future.result()
+                except Exception as e:
+                    logger.error(f"Error processing episode: {e}")
+                    print(traceback.format_exc())
+                    raise e
                 for meta in self.state_meta:
-                    key = meta["key"]
-                    cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
-                    state_min[key].append(cur_state.amin(0))
-                    state_max[key].append(cur_state.amax(0))
-                    state_mean[key].append(cur_state.mean(0))
-                    state_var[key].append(cur_state.var(0))
-                    state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
-                    state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                    accumulate("state", meta, batch["state"][meta["key"]])
                 for meta in self.action_meta:
-                    key = meta["key"]
-                    cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
-                    action_min[key].append(cur_action.amin(0))
-                    action_max[key].append(cur_action.amax(0))
-                    action_mean[key].append(cur_action.mean(0))
-                    action_var[key].append(cur_action.var(0))
-                    action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
-                    action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
-        
-        else:
-            with ThreadPoolExecutor() as executor:
-                futures = [executor.submit(process_episode, num) for num in range(episodes_num)]
-                
-                for future in tqdm(as_completed(futures), total=episodes_num, desc="Iterating dataset to get normalization"):
-                    try:
-                        batch = future.result()
-                        for meta in self.state_meta:
-                            key = meta["key"]
-                            cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
-                            state_min[key].append(cur_state.amin(0))
-                            state_max[key].append(cur_state.amax(0))
-                            state_mean[key].append(cur_state.mean(0))
-                            state_var[key].append(cur_state.var(0))
-                            state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
-                            state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                    accumulate("action", meta, batch["action"][meta["key"]])
 
-                        for meta in self.action_meta:
-                            key = meta["key"]
-                            cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
-                            action_min[key].append(cur_action.amin(0))
-                            action_max[key].append(cur_action.amax(0))
-                            action_mean[key].append(cur_action.mean(0))
-                            action_var[key].append(cur_action.var(0))
-                            action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
-                            action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
-
-                    except Exception as e:
-                        logger.error(f"Error processing episode: {e}")
-                        print(traceback.format_exc())
-                        raise e
+        if world_size > 1:
+            self._combine_sharded_stats(extremes, sums)
 
         # assume that each minibatch has equal number of samples
-        def get_mean_std(means, vars):
-            means = torch.stack(means)
-            vars = torch.stack(vars)
-            stepwise_mean = means.mean(0)
-            stepwise_std = (vars + (means - stepwise_mean) ** 2).mean(0).sqrt()
-            global_mean = means.mean((0, 1))
-            global_std = (vars + (means - global_mean) ** 2).mean((0, 1)).sqrt()
-            return stepwise_mean, stepwise_std, global_mean, global_std
+        def get_mean_std(group, key):
+            sum_mean = sums[(group, key, "mean")]
+            sum_var = sums[(group, key, "var")]
+            sum_sq = sums[(group, key, "sq")]
+            n = float(episodes_num)
+            stepwise_mean = sum_mean / n
+            stepwise_std = (sum_var / n + sum_sq / n - stepwise_mean ** 2).clamp_min(0).sqrt()
+            global_mean = sum_mean.mean(0) / n
+            global_std = (sum_var.mean(0) / n + sum_sq.mean(0) / n - global_mean ** 2).clamp_min(0).sqrt()
+            return (
+                stepwise_mean.float(),
+                stepwise_std.float(),
+                global_mean.float(),
+                global_std.float(),
+            )
 
         stats = {"state": DefaultDict(dict), "action": DefaultDict(dict), "num_episodes": episodes_num, "num_transition": self.multi_dataset.num_frames}
-        for meta in self.state_meta:
-            key = meta["key"]
-            stats["state"][key]["stepwise_min"] = torch.stack(state_min[key]).amin(0)
-            stats["state"][key]["stepwise_max"] = torch.stack(state_max[key]).amax(0)
-            stats["state"][key]["global_min"] = stats["state"][key]["stepwise_min"].amin(0)
-            stats["state"][key]["global_max"] = stats["state"][key]["stepwise_max"].amax(0)
-            stats["state"][key]["stepwise_q01"] = torch.stack(state_q01[key]).amin(0)
-            stats["state"][key]["stepwise_q99"] = torch.stack(state_q99[key]).amax(0)
-            stats["state"][key]["global_q01"] = stats["state"][key]["stepwise_q01"].amin(0)
-            stats["state"][key]["global_q99"] = stats["state"][key]["stepwise_q99"].amax(0)
-            (
-                stats["state"][key]["stepwise_mean"],
-                stats["state"][key]["stepwise_std"],
-                stats["state"][key]["global_mean"],
-                stats["state"][key]["global_std"],
-            ) = get_mean_std(state_mean[key], state_var[key])
-
-        for meta in self.action_meta:
-            key = meta["key"]
-            stats["action"][key]["stepwise_min"] = torch.stack(action_min[key]).amin(0)
-            stats["action"][key]["stepwise_max"] = torch.stack(action_max[key]).amax(0)
-            stats["action"][key]["global_min"] = stats["action"][key]["stepwise_min"].amin(0)
-            stats["action"][key]["global_max"] = stats["action"][key]["stepwise_max"].amax(0)
-            stats["action"][key]["stepwise_q01"] = torch.stack(action_q01[key]).amin(0)
-            stats["action"][key]["stepwise_q99"] = torch.stack(action_q99[key]).amax(0)
-            stats["action"][key]["global_q01"] = stats["action"][key]["stepwise_q01"].amin(0)
-            stats["action"][key]["global_q99"] = stats["action"][key]["stepwise_q99"].amax(0)
-            (
-                stats["action"][key]["stepwise_mean"], 
-                stats["action"][key]["stepwise_std"], 
-                stats["action"][key]["global_mean"], 
-                stats["action"][key]["global_std"],
-            ) = get_mean_std(action_mean[key], action_var[key])
+        for group, metas in (("state", self.state_meta), ("action", self.action_meta)):
+            for meta in metas:
+                key = meta["key"]
+                entry = stats[group][key]
+                entry["stepwise_min"] = torch.stack(extremes[(group, key, "min")]).amin(0)
+                entry["stepwise_max"] = torch.stack(extremes[(group, key, "max")]).amax(0)
+                entry["global_min"] = entry["stepwise_min"].amin(0)
+                entry["global_max"] = entry["stepwise_max"].amax(0)
+                entry["stepwise_q01"] = torch.stack(extremes[(group, key, "q01")]).amin(0)
+                entry["stepwise_q99"] = torch.stack(extremes[(group, key, "q99")]).amax(0)
+                entry["global_q01"] = entry["stepwise_q01"].amin(0)
+                entry["global_q99"] = entry["stepwise_q99"].amax(0)
+                (
+                    entry["stepwise_mean"],
+                    entry["stepwise_std"],
+                    entry["global_mean"],
+                    entry["global_std"],
+                ) = get_mean_std(group, key)
 
         return stats
+
+    @staticmethod
+    def _combine_sharded_stats(extremes, sums):
+        """All-reduce the per-rank partial aggregates of `get_dataset_stats`."""
+        import torch.distributed as dist
+
+        device = _stats_all_reduce_device()
+        min_keys = sorted(k for k in extremes if k[2] in ("min", "q01"))
+        max_keys = sorted(k for k in extremes if k[2] in ("max", "q99"))
+        sum_keys = sorted(sums)
+        if not min_keys or not max_keys or not sum_keys:
+            raise RuntimeError(
+                f"rank {dist.get_rank()} processed no episodes and cannot contribute to dataset stats; "
+                f"set FASTWAM_STATS_SHARDING=0 to disable sharding"
+            )
+
+        local = {k: torch.stack(extremes[k]).amin(0) for k in min_keys}
+        local.update({k: torch.stack(extremes[k]).amax(0) for k in max_keys})
+        local.update(sums)
+
+        def pack(keys):
+            shapes = [local[k].shape for k in keys]
+            flat = torch.cat([local[k].reshape(-1) for k in keys]).to(device=device, dtype=torch.float64)
+            return flat, shapes
+
+        def unpack(flat, keys, shapes):
+            out, offset = {}, 0
+            for key, shape in zip(keys, shapes):
+                numel = 1
+                for dim in shape:
+                    numel *= int(dim)
+                out[key] = flat[offset:offset + numel].reshape(shape)
+                offset += numel
+            return out
+
+        min_flat, min_shapes = pack(min_keys)
+        max_flat, max_shapes = pack(max_keys)
+        sum_flat, sum_shapes = pack(sum_keys)
+        dist.all_reduce(min_flat, op=dist.ReduceOp.MIN)
+        dist.all_reduce(max_flat, op=dist.ReduceOp.MAX)
+        dist.all_reduce(sum_flat, op=dist.ReduceOp.SUM)
+
+        reduced = {}
+        reduced.update({k: v.float() for k, v in unpack(min_flat.cpu(), min_keys, min_shapes).items()})
+        reduced.update({k: v.float() for k, v in unpack(max_flat.cpu(), max_keys, max_shapes).items()})
+        reduced.update({k: v.double() for k, v in unpack(sum_flat.cpu(), sum_keys, sum_shapes).items()})
+
+        for key in min_keys + max_keys:
+            extremes[key] = [reduced[key]]
+        for key in sum_keys:
+            sums[key] = reduced[key]
 
 
 def sliding_window_with_replication(x: torch.Tensor, window_size: int) -> torch.Tensor:

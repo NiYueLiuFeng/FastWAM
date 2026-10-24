@@ -22,6 +22,18 @@ logger = get_logger(__name__)
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
+
+def _stats_shard_info():
+    """(rank, world_size) used to shard the dataset stats computation over ranks."""
+    if os.environ.get("FASTWAM_STATS_SHARDING", "1") == "0":
+        return 0, 1
+    # PartialState() is what brings up the process group under `accelerate launch`
+    PartialState()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return 0, 1
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     base_dataset_cls = BaseLerobotDataset
 
@@ -99,17 +111,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
-                if PartialState().is_main_process:
-                    logger.info("Calculating dataset stats for normalization...")
-                    dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
+                rank, world_size = _stats_shard_info()
+                if rank == 0:
+                    logger.info(
+                        "Calculating dataset stats for normalization: %d episodes sharded over %d rank(s)...",
+                        self.lerobot_dataset.multi_dataset.num_episodes,
+                        world_size,
+                    )
+                dataset_stats = self.lerobot_dataset.get_dataset_stats(
+                    processor, rank=rank, world_size=world_size
+                )
+                if rank == 0:
                     work_dir = misc.get_work_dir()
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
-                else:
-                    dataset_stats = None
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    obj_list = [dataset_stats]
-                    torch.distributed.broadcast_object_list(obj_list, src=0)
-                    dataset_stats = obj_list[0]
+                # every rank already holds the same stats: they come back from the
+                # all_reduce inside get_dataset_stats, no broadcast needed
             else:
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
