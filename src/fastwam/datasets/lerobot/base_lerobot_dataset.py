@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import numpy as np
 from pathlib import Path
@@ -324,6 +325,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 sums[(group, key, name)] = value.clone() if prev is None else prev + value
 
         local_indices = list(range(rank, episodes_num, world_size))
+        started_at = time.time()
+        logger.info(
+            "rank %d/%d: computing stats over %d of %d episodes",
+            rank, world_size, len(local_indices), episodes_num,
+        )
         with ThreadPoolExecutor() as executor:
             futures = [executor.submit(process_episode, num) for num in local_indices]
             progress = tqdm(
@@ -344,6 +350,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 for meta in self.action_meta:
                     accumulate("action", meta, batch["action"][meta["key"]])
 
+        logger.info(
+            "rank %d/%d: local episodes done in %.1f s%s",
+            rank, world_size, time.time() - started_at,
+            ", waiting for all_reduce" if world_size > 1 else "",
+        )
         if world_size > 1:
             self._combine_sharded_stats(extremes, sums)
 
