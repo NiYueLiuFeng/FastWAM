@@ -139,7 +139,7 @@ json 里只有 `num_episodes` / `num_transition` 两个计数，可以据此做�
 ## 5. 长期改进（按性价比）
 
 1. **优先复用**（零代码改动）：`--norm-stats` / `data.train.pretrained_norm_stats`。
-2. ✅ **已实现：统计计算分片到所有 rank + `all_reduce`**（见第 7 节）。4 卡并行，40 分钟 → ~10 分钟。
+2. ✅ **已实现：统计计算分片到所有 rank + `all_reduce`**（见第 7 节）。4 卡并行，实测 **2330 s → 626 s（3.7×）**。
 3. **不要把 stats 用 `broadcast_object_list` 传**：✅ 已随第 2 条一起去掉——分片后每个 rank 通过 `all_reduce` 直接拿到相同结果，不再需要广播。
 4. **统计循环本身**：`get_episode_data` 每个 episode 都 `hf_dataset.select()` 一次、再把 Arrow 列转成 Python list（`lerobot3/lerobot_dataset.py:260-273`），是主要瓶颈；改成一次性读 parquet + numpy 向量化还能再快一个量级。
 5. **进程组超时**：1800 s 是 torch 默认值，这类"单 rank 长计算 + 集体等待"的结构天然容易撞上。分片后单 rank 的计算量降到 1/N，风险大幅下降，但 episode 数特别大时仍可考虑调长 timeout。
@@ -152,8 +152,9 @@ json 里只有 `num_episodes` / `num_transition` 两个计数，可以据此做�
 | 2026-10-23 11:40 | `autogen_mixed_charger_white` | 527 / 108,468 | 337 s（11:41:38→11:47:15） |
 | 2026-10-24 04:56 | `autogen_mixed_guodi_wrc` | 1497 / 971,872 | ~2330 s，超时崩溃 |
 | 2026-10-24 06:28 | `autogen_mixed_guodi_wrc` | 1497 / 971,872 | tqdm 外推 ~40 min（未跑完） |
+| 2026-10-24 07:27 | `autogen_mixed_guodi_wrc` | 1497 / 971,872 | **626 s**（4 rank 分片，07:28:56→07:39:22） |
 
-结论：**30 分钟的 NCCL 超时对"中等以上规模数据集"的 stats 计算是随时会踩的坑**，缓存 stats 是当前最省事的规避方式。
+结论：**30 分钟的 NCCL 超时对"中等以上规模数据集"的 stats 计算是随时会踩的坑**。分片（第 7 节）已把单次耗时压到安全区，缓存 stats 则是连这 10 分钟也省掉的做法。
 
 ## 7. 分片计算 stats（已实现）
 
@@ -184,5 +185,7 @@ global_std    = sqrt(mean_t(Σvar)/N + mean_t(Σmean²)/N - global_mean²)
 - 分片是**结果等价**的，不是近似：min / max / 分位数本来就是"跨 episode 取极值"，mean / std 是"每个 episode 等权"，求和后除以总 episode 数即可。
 - 退化保护：`world_size > episode 数` 时自动退回单进程全量计算（每个 rank 各算一遍，结果仍一致）。
 - 关闭开关：`FASTWAM_STATS_SHARDING=0`，退回"每个 rank 全量计算"（不再用 `broadcast_object_list`，也就不会再有那个 39 分钟的超时）。
-- 验证：以 1 / 2 / 4 rank 三种配置（gloo，多进程）对同一份合成数据集计算，与原始单进程实现的最大绝对误差为 `2.4e-07`（float32 精度量级），退化路径同样一致。
+- 日志：每个 rank 都会打印 `rank r/W: computing stats over M of N episodes` 与 `rank r/W: local episodes done in X s`，便于确认各 rank 都在干活（tqdm 进度条仍只在 rank0 显示，避免多进程输出互相覆盖）。
+- 验证（离线）：以 1 / 2 / 4 rank 三种配置（gloo，多进程）对同一份合成数据集计算，与原始单进程实现的最大绝对误差为 `2.4e-07`（float32 精度量级），退化路径同样一致。
+- 验证（真实数据，2026-10-24 07:27 run）：1497 episodes → `375/375 [10:26]`，总计 **626 s**（原 ~2330 s，3.7×）；`all_reduce` 在 **NCCL + CUDA float64** 上正常完成，随后 `>> Accelerate training` 正常启动，全程无超时。与该 run 之前 04:56 那次单进程算出的 stats 逐项比对，26 个叶子统计量**最大绝对误差 1.19e-07**，即分片结果与原实现等价。
 
