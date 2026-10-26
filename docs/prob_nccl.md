@@ -141,7 +141,7 @@ json 里只有 `num_episodes` / `num_transition` 两个计数，可以据此做�
 1. **优先复用**（零代码改动）：`--norm-stats` / `data.train.pretrained_norm_stats`。
 2. ✅ **已实现：统计计算分片到所有 rank + `all_reduce`**（见第 7 节）。4 卡并行，实测 **2330 s → 626 s（3.7×）**。
 3. **不要把 stats 用 `broadcast_object_list` 传**：✅ 已随第 2 条一起去掉——分片后每个 rank 通过 `all_reduce` 直接拿到相同结果，不再需要广播。
-4. **统计循环本身**：`get_episode_data` 每个 episode 都 `hf_dataset.select()` 一次、再把 Arrow 列转成 Python list（`lerobot3/lerobot_dataset.py:260-273`），是主要瓶颈；改成一次性读 parquet + numpy 向量化还能再快一个量级。
+4. ✅ **已实现：统计循环按列读 parquet**（见第 8 节）。`get_episode_data` 原来每个 episode 都 `hf_dataset.select()` 一次、再把该 episode 的**所有非视频列**转成 Python list（`lerobot3/lerobot_dataset.py:260-273`），而 stats 只需要 action / state 两列；现在改成每个数据集一次 `pyarrow.parquet.read_table(columns=[...])`，实测比逐 episode 读快 2~3 个量级。
 5. **进程组超时**：1800 s 是 torch 默认值，这类"单 rank 长计算 + 集体等待"的结构天然容易撞上。分片后单 rank 的计算量降到 1/N，风险大幅下降，但 episode 数特别大时仍可考虑调长 timeout。
 
 ## 6. 附：几次运行的统计耗时对照
@@ -188,4 +188,41 @@ global_std    = sqrt(mean_t(Σvar)/N + mean_t(Σmean²)/N - global_mean²)
 - 日志：每个 rank 都会打印 `rank r/W: computing stats over M of N episodes` 与 `rank r/W: local episodes done in X s`，便于确认各 rank 都在干活（tqdm 进度条仍只在 rank0 显示，避免多进程输出互相覆盖）。
 - 验证（离线）：以 1 / 2 / 4 rank 三种配置（gloo，多进程）对同一份合成数据集计算，与原始单进程实现的最大绝对误差为 `2.4e-07`（float32 精度量级），退化路径同样一致。
 - 验证（真实数据，2026-10-24 07:27 run）：1497 episodes → `375/375 [10:26]`，总计 **626 s**（原 ~2330 s，3.7×）；`all_reduce` 在 **NCCL + CUDA float64** 上正常完成，随后 `>> Accelerate training` 正常启动，全程无超时。与该 run 之前 04:56 那次单进程算出的 stats 逐项比对，26 个叶子统计量**最大绝对误差 1.19e-07**，即分片结果与原实现等价。
+
+## 8. 按列读 parquet 计算 stats（已实现）
+
+第 7 节解决了"只有 rank0 干活"的问题，但每个 episode 的读取成本还在。`get_episode_data` 走的是训练用的通用读取路径：`hf_dataset.select(range(start, end))` 之后对这个 episode 的**每一列**做 Arrow → numpy → tensor，最后再按 `delta_timestamps` 取滑窗。对 `ur5e_v30` 这类带相机内外参、力/力矩等 26 个非视频列的数据集，stats 只需要其中 2 列，却要为另外 24 列付出 15 倍以上的读取与转换开销（warm cache 实测 0.250 s/ep vs 0.014 s/ep）。
+
+### 设计
+
+- `src/fastwam/datasets/lerobot/utils/parquet_columns.py`（新增）
+  - `check_bulk_columns(dataset, keys)`：**开跑前**把整份布局验一遍——`pq.read_schema` 查列，再单读一次 `episode_index` 确认每个 episode 都是连续块且都在文件里；不满足就抛 `UnsupportedBulkRead`。这样正式读取不会中途失败、留下半份统计量。（单读 `episode_index` 实测 0.3 s 量级，且顺带预热了页脚，后面那次全量读更快。）
+  - `iter_bulk_episodes(dataset, keys)`：对每个数据集只跑**一次** `pq.read_table(paths, columns=[*keys, "episode_index"])`，按 `episode_index` 的连续块切出每个 episode 的 `{列名: 行}`，逐 episode yield。
+  - `iter_multi_dataset_episodes(datasets, keys)`：多个数据集按顺序拼接，episode 编号转成全局编号。
+  - `_column_to_numpy()`：v3 的 `fixed_size_list<float, D>` 与 v2 的 `list<float>` 都还原成 `[T, D]`；行宽不一致或 episode 行不连续时抛 `UnsupportedBulkRead`，由调用方回退。
+- `src/fastwam/datasets/lerobot/base_lerobot_dataset.py`
+  - `_accumulate_stats_from_columns()`：stats 循环优先走这条路径。仍然复用 `_assemble_episode_sample()` + `preprocessor.action_state_transform()`，所以**统计口径（滑窗、delta action、维度）与训练时完全一致**，只是数据来源从"逐 episode 读全列"换成"一次读需要的列"。
+  - 分片逻辑不变：先按 `range(rank, N, world_size)` 过滤，再只累加属于本 rank 的 episode。
+  - 任一数据集不支持（缺列、缺 `episode_index`、行宽不一致、数据集类没实现读取方法）时打印一行日志并**回退到原来的逐 episode 路径**，行为不受影响。
+- `lerobot3/lerobot_dataset.py` / `lerobot/lerobot_dataset.py`：`LeRobotDataset` 提供 `bulk_data_paths()` / `bulk_episode_ids()`，`MultiLeRobotDataset` 提供 `check_bulk_columns()` / `iter_bulk_episode_columns()`。两种布局都能读：v3 是 `data/*/*.parquet`，v2 是 `meta.get_data_file_path(ep)` 的每 episode 一个文件。
+
+开关：`FASTWAM_STATS_BULK_READ=0` 强制走旧的逐 episode 路径（用于对比或排障）。
+
+### 实测
+
+| 数据集 | episodes / 帧数 | 逐 episode | 按列读 | 加速 |
+|---|---|---|---|---|
+| `ur5e_v30` 混合（26 个非视频列） | 455 / 223,686 | 5.4 s/ep → **40.9 min** | **2.1 s** | ~1000× |
+| `guodi_sanitized_v21` 混合（7 列，v2.1） | 1497 / 971,872 | 52.3 s（线程池） | **10.5 s** | 5× |
+
+`ur5e_v30` 的 5.4 s/ep 是本机离线测得的；容器里跑训练那次（2026-10-25 15:44）是 5~90 s/ep，主要被 SFS 上的随机读拖慢，按列读把这部分几乎完全消掉。
+
+### 正确性验证
+
+- **样本一致**：3 个 `ur5e_v30` 数据集跨边界取 9 个 episode、`guodi_sanitized_v21` 取 9 个 episode，按列读拼出的 `{action, state}` 与 `get_episode_data()` 的结果**逐位相同**（max abs diff `0.000e+00`）。
+- **统计一致**：`guodi_sanitized_v21` 上按列读与 `FASTWAM_STATS_BULK_READ=0` 的 24 个统计量**完全相等**（`0.000e+00`），`num_episodes` / `num_transition` 不变。
+- **分片一致**：2 rank（gloo）与单进程结果同样 `0.000e+00`。
+- **端到端**：与 `2026-10-25_15-44-43` 那次 run（旧代码、4 rank、NCCL 分片）在真实数据集上算出的 `dataset_stats.json` 逐项比对，24 个统计量**最大绝对误差 `0.000e+00`**。
+- **对着独立参考**：另写一份"直接从 parquet 列算 stats"的实现（复用同样的 float32 归约 + float64 累加），在 `ur5e_v30` 的 16 个统计量上最大误差 `1.19e-07`（float32 量级），`num_episodes=455` / `num_transition=223686` 不变。
+- 精度旁注：若参考实现改用纯 numpy float64（`np.var(dtype=float64)`），`state.stepwise_std` 会差 `7.1e-04`（相对 `1.4e-3`）。这一项来自**原有**实现里 `torch.var` 先在 float32 上算方差（`Σvar` 之后才升 float64），已单独验证把参考也换成 float32 求方差后差值归零，属于既有精度特性，本次没有改动（如需更准可把 `accumulate()` 里的 `cur.var(0)` 改成 float64，代价是与历史 stats 有一处 `1e-3` 量级的变化）。
 

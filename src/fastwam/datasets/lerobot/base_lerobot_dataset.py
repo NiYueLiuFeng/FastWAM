@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from fastwam.utils.logging_config import get_logger
 from .processors.base_processor import BaseProcessor
+from .utils.parquet_columns import UnsupportedBulkRead
 
 logger = get_logger(__name__)
 
@@ -194,7 +195,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return lerobot_sample
     
     def _get_episode_data(self, episode_idx):
-        lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
+        return self._assemble_episode_sample(self.multi_dataset.get_episode_data(episode_idx))
+
+    def _assemble_episode_sample(self, lerobot_sample):
+        """Turn raw `{column: rows}` data into the `{action, state}` dict the processor expects."""
         lerobot_sample = self._split_lerobot_sample(lerobot_sample)
         state, action = {}, {}
         for meta in self.state_meta:
@@ -330,25 +334,33 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "rank %d/%d: computing stats over %d of %d episodes",
             rank, world_size, len(local_indices), episodes_num,
         )
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_episode, num) for num in local_indices]
-            progress = tqdm(
-                as_completed(futures),
-                total=len(local_indices),
-                desc=f"Iterating dataset to get normalization (rank {rank}/{world_size}: {len(local_indices)} of {episodes_num} episodes)",
-                disable=world_size > 1 and rank != 0,
-            )
-            for future in progress:
-                try:
-                    batch = future.result()
-                except Exception as e:
-                    logger.error(f"Error processing episode: {e}")
-                    print(traceback.format_exc())
-                    raise e
-                for meta in self.state_meta:
-                    accumulate("state", meta, batch["state"][meta["key"]])
-                for meta in self.action_meta:
-                    accumulate("action", meta, batch["action"][meta["key"]])
+
+        def accumulate_batch(batch):
+            for meta in self.state_meta:
+                accumulate("state", meta, batch["state"][meta["key"]])
+            for meta in self.action_meta:
+                accumulate("action", meta, batch["action"][meta["key"]])
+
+        progress = tqdm(
+            total=len(local_indices),
+            desc=f"Iterating dataset to get normalization (rank {rank}/{world_size}: {len(local_indices)} of {episodes_num} episodes)",
+            disable=world_size > 1 and rank != 0,
+        )
+        with progress:
+            if not self._accumulate_stats_from_columns(
+                progress, local_indices, preprocessor, accumulate_batch
+            ):
+                with ThreadPoolExecutor() as executor:
+                    futures = [executor.submit(process_episode, num) for num in local_indices]
+                    for future in as_completed(futures):
+                        try:
+                            batch = future.result()
+                        except Exception as e:
+                            logger.error(f"Error processing episode: {e}")
+                            print(traceback.format_exc())
+                            raise e
+                        accumulate_batch(batch)
+                        progress.update(1)
 
         logger.info(
             "rank %d/%d: local episodes done in %.1f s%s",
@@ -396,6 +408,45 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 ) = get_mean_std(group, key)
 
         return stats
+
+    def _accumulate_stats_from_columns(self, progress, local_indices, preprocessor, accumulate_batch) -> bool:
+        """Accumulate stats from one column-selective pass over the data parquet.
+
+        The stats only need the action / state columns, so reading them directly
+        (one sequential read per dataset) replaces N per-episode reads that also
+        materialize every other non-video column.
+
+        Returns False when the datasets cannot be read this way, so the caller can
+        fall back to reading episode by episode.
+        """
+        if os.environ.get("FASTWAM_STATS_BULK_READ", "1") == "0":
+            return False
+
+        check_columns = getattr(self.multi_dataset, "check_bulk_columns", None)
+        iter_columns = getattr(self.multi_dataset, "iter_bulk_episode_columns", None)
+        if check_columns is None or iter_columns is None:
+            logger.info("bulk stats read unavailable (dataset has no column reader); reading episodes one by one")
+            return False
+
+        keys = list(dict.fromkeys(
+            meta["lerobot_key"] for meta in [*self.state_meta, *self.action_meta]
+        ))
+        try:
+            check_columns(keys)
+        except UnsupportedBulkRead as exc:
+            logger.info("bulk stats read unavailable (%s); reading episodes one by one", exc)
+            return False
+
+        wanted = set(local_indices)
+        for episode_idx, columns in iter_columns(keys):
+            if episode_idx not in wanted:
+                continue
+            # copy: the arrow buffers are read-only, and a transform may write in place
+            sample = {key: torch.tensor(values) for key, values in columns.items()}
+            batch = self._assemble_episode_sample(sample)
+            accumulate_batch(preprocessor.action_state_transform(batch))
+            progress.update(1)
+        return True
 
     @staticmethod
     def _combine_sharded_stats(extremes, sums):

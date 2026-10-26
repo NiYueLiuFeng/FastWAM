@@ -31,6 +31,11 @@ from fastwam.datasets.lerobot.lerobot.datasets.video_utils import (
     decode_video_frames,
     get_safe_default_codec,
 )
+from fastwam.datasets.lerobot.utils.parquet_columns import (
+    UnsupportedBulkRead,
+    check_bulk_columns,
+    iter_multi_dataset_episodes,
+)
 
 CODEBASE_VERSION = packaging.version.parse("3.0")
 
@@ -272,6 +277,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 result[key] = np.asarray(values)
         return result
 
+    def bulk_data_paths(self) -> list[Path]:
+        """Data parquet files, in the same row order as `hf_dataset`."""
+        paths = sorted((self.root / "data").glob("*/*.parquet"))
+        if not paths:
+            raise UnsupportedBulkRead(f"no data parquet files under {self.root / 'data'}")
+        return paths
+
+    def bulk_episode_ids(self) -> list[int]:
+        return [int(episode) for episode in self.episodes]
+
     def __len__(self):
         return self.num_frames
 
@@ -384,6 +399,15 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 return dataset.get_episode_data(episode_index)
             episode_index -= dataset.num_episodes
         raise IndexError("Episode index out of bounds.")
+
+    def check_bulk_columns(self, keys) -> None:
+        """Verify every dataset can bulk-read `keys`; raises `UnsupportedBulkRead`."""
+        for dataset in self._datasets:
+            check_bulk_columns(dataset, keys)
+
+    def iter_bulk_episode_columns(self, keys):
+        """Yield `(global_episode_index, {key: rows})` over all episodes, in order."""
+        return iter_multi_dataset_episodes(self._datasets, keys)
 
     def __len__(self):
         return self.num_frames

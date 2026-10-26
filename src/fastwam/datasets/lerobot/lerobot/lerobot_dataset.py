@@ -34,6 +34,11 @@ from huggingface_hub.errors import RevisionNotFoundError
 
 # adapte to own path
 from ..constants import HF_LEROBOT_HOME
+from ..utils.parquet_columns import (
+    UnsupportedBulkRead,
+    check_bulk_columns,
+    iter_multi_dataset_episodes,
+)
 from .datasets.compute_stats import aggregate_stats, compute_episode_stats
 from .datasets.utils import (
     DEFAULT_FEATURES,
@@ -717,6 +722,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
         res = {key : torch.stack(selected_data[key]) for key in res_keys}
         return res
 
+    def bulk_data_paths(self) -> list[Path]:
+        """Per-episode data parquet files, in the same order as `self.episodes`."""
+        episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
+        paths = [self.root / self.meta.get_data_file_path(int(episode)) for episode in episodes]
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise UnsupportedBulkRead(f"missing data parquet files: {missing[:3]}")
+        return paths
+
+    def bulk_episode_ids(self) -> list[int]:
+        if self.episodes is not None:
+            return [int(episode) for episode in self.episodes]
+        return list(range(self.meta.total_episodes))
+
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
@@ -1257,6 +1276,15 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             else:
                 episode_idx -= dataset.num_episodes
         raise IndexError(f"Episode index {episode_idx} out of bounds.")
+
+    def check_bulk_columns(self, keys) -> None:
+        """Verify every dataset can bulk-read `keys`; raises `UnsupportedBulkRead`."""
+        for dataset in self._datasets:
+            check_bulk_columns(dataset, keys)
+
+    def iter_bulk_episode_columns(self, keys):
+        """Yield `(global_episode_index, {key: rows})` over all episodes, in order."""
+        return iter_multi_dataset_episodes(self._datasets, keys)
 
     def __len__(self):
         return self.num_frames
