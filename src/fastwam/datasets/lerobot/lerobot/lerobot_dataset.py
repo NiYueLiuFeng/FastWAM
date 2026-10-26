@@ -671,13 +671,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return query_indices, padding
 
+    @property
+    def decoded_video_keys(self) -> list[str]:
+        """Video columns to decode: only the cameras requested through `delta_timestamps`.
+
+        Datasets routinely carry extra video streams (depth, extra views) that no
+        `shape_meta` entry uses. Decoding them is wasted work, and a stream whose
+        timestamps drift outside `tolerance_s` - or whose file is missing entirely -
+        then fails otherwise perfectly good samples.
+        """
+        if self.delta_indices is None:
+            return list(self.meta.video_keys)
+        return [key for key in self.meta.video_keys if key in self.delta_indices]
+
     def _get_query_timestamps(
         self,
         current_ts: float,
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        for key in self.decoded_video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
                 query_timestamps[key] = torch.stack(list(timestamps)).tolist()
@@ -771,16 +784,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self.meta.video_keys) > 0 and self.during_training:
+        if len(self.decoded_video_keys) > 0 and self.during_training:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+            for cam in self.meta.camera_keys:
+                if cam in item:  # only the decoded cameras are here
+                    item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
         task_idx = item["task_index"].item()

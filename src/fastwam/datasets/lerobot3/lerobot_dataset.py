@@ -237,9 +237,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
             result[key] = torch.stack(list(selected[key]))
         return result
 
+    @property
+    def decoded_video_keys(self) -> list[str]:
+        """Video columns to decode: only the cameras requested through `delta_timestamps`.
+
+        Datasets routinely carry extra video streams (depth, extra views) that no
+        `shape_meta` entry uses. Decoding them is wasted work, and a stream whose
+        timestamps drift outside `tolerance_s` - or whose file is missing entirely -
+        then fails otherwise perfectly good samples.
+        """
+        if self.delta_indices is None:
+            return list(self.meta.video_keys)
+        return [key for key in self.meta.video_keys if key in self.delta_indices]
+
     def _query_timestamps(self, current_timestamp: float, query_indices):
         timestamps = {}
-        for key in self.meta.video_keys:
+        for key in self.decoded_video_keys:
             if query_indices is not None and key in query_indices:
                 values = self.hf_dataset.select(query_indices[key])["timestamp"]
                 timestamps[key] = torch.stack(list(values)).tolist()
@@ -298,13 +311,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_indices, padding = self._get_query_indices(idx, episode_index)
             item = {**item, **padding, **self._query_data(query_indices)}
 
-        if self.meta.video_keys and self.during_training:
+        if self.decoded_video_keys and self.during_training:
             timestamps = self._query_timestamps(float(item["timestamp"]), query_indices)
             item = {**self._query_videos(timestamps, episode_index), **item}
 
         if self.image_transforms is not None:
             for camera_key in self.meta.camera_keys:
-                item[camera_key] = self.image_transforms(item[camera_key])
+                if camera_key in item:  # only the decoded cameras are here
+                    item[camera_key] = self.image_transforms(item[camera_key])
 
         task_index = item["task_index"]
         if task_index.ndim == 0:
