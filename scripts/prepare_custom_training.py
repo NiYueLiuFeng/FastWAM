@@ -52,9 +52,9 @@ DEFAULT_EPOCHS = 1
 # 有效 batch = batch_size × 卡数 × gradient_accumulation_steps
 DEFAULT_GRAD_ACCUM = 1
 DEFAULT_LR = 1e-4
-DEFAULT_SAVE_EVERY = 2000
+DEFAULT_SAVE_EVERY = 3000
 # 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
-DEFAULT_KEEP_LAST_N = 2
+DEFAULT_KEEP_LAST_N = 4
 # None = 按 num_epochs 和样本数自动算总步数（见 fastwam/trainer.py:_estimate_total_train_steps）。
 DEFAULT_MAX_STEPS: int | None = None
 # delta-action 默认只转换位姿 6 维（x, y, z, rot_a, rot_b, rot_c）；
@@ -841,7 +841,7 @@ def render_task_yaml(task_name: str, model: str, policy: Policy, datasets: Seque
         + "log_every: 10\n"
         + f"save_every: {policy.save_every}\n"
         + f"keep_last_n: {policy.keep_last_n}\n"
-        + "eval_every: 50\n"
+        + "eval_every: 5000\n"
         + f"gradient_accumulation_steps: {policy.gradient_accumulation_steps}\n"
         + "weight_decay: 1.0e-2\n"
         + "resume: null\n"
