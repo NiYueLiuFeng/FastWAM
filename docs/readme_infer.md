@@ -37,7 +37,7 @@
 - [3. 启动推理服务](#3-启动推理服务)
 - [4. 验证服务](#4-验证服务)
 - [5. 请求 body 示例](#5-请求-body-示例)
-- [6. 机器人侧完整客户端](#6-机器人侧完整客户端)
+- [6. 机器人侧客户端](#6-机器人侧客户端)
 - [7. 后台常驻与停止](#7-后台常驻与停止)
 - [8. 常见问题](#8-常见问题)
 - [9. 最短路径总结](#9-最短路径总结)
@@ -319,10 +319,10 @@ python examples/ws_client.py \
 - **不能拼错字段名，也不能多加字段**。请求模型是 pydantic `extra="forbid"`，
   多一个未知键（比如 `image` 写成 `images`、`num_steps` 写成 `num_inference_steps`）
   会直接返回 `BAD_REQUEST: invalid infer frame`。
-- 每条连接**先发一帧 `hello`**，之后才发 `infer`；把 `infer` 当第一帧发会被
-  `UNSUPPORTED_FORMAT` 关掉。
+- `hello` 是**可选**的：不握手时把 token 放在 URL（`?token=...`），并且每次 `infer`
+  都要带 `prompt`（没有会话默认值可用）。
 
-### 5.1 `hello`：建连后的第一帧
+### 5.1 `hello`（可选）：设置会话默认值
 
 ```json
 {
@@ -345,6 +345,10 @@ python examples/ws_client.py \
 | `client` | 否 | 客户端标识，只进日志 | 任意 |
 | `prompt` | 否 | 会话默认指令；`infer` 里带 `prompt` 时会覆盖它，所以只跑固定任务时才需要填 | 见下方两条指令 |
 | `options` | 否 | 会话默认推理参数，字段同 5.2 的 `options` | `{"num_inference_steps": 10}` |
+
+握手的作用是省掉每次请求里的 `prompt` / `options`，并拿回 `hello_ack.model`
+（相机 key/顺序/尺寸、`state_dim`、`action_dim`、`action_horizon`）和 `limits`。
+不需要这些信息时，可以整帧省略，见 5.4。
 
 `prompt` 必须是当前场景对应的指令，这个 checkpoint 只认这两条：
 
@@ -413,7 +417,46 @@ wipe the charactor 'T' on the whiteboard at the end of 'CloudRoboT'.
   相同 prompt 会命中服务端 LRU 缓存（`timing.text_ms ≈ 0`）；新 prompt 第一次会
   多一次文本编码开销。
 
-### 5.3 按需求改哪个字段
+### 5.3 图像尺寸要求（image_size）
+
+- **客户端传原图即可，不用自己 resize / 裁剪**：服务端对每路图做保比例缩放 + 中心裁剪
+  到该相机的目标尺寸，再按 `concat_multi_camera` 拼接。
+- 目标尺寸来自 task 对应的 data 配置，不是服务端写死的默认值。本任务
+  `configs/data/autogen_mixed_charger_white.yaml`：每路 `shape: [3, 224, 224]`，
+  两路横向拼成 `video_size: [224, 448]`。换 task 会自动变，可查 `/v1/info` 或
+  `hello_ack.model.cameras[].shape`。
+- 数据集原始帧是 `raw_shape: [3, 360, 640]`，但**客户端不必按这个尺寸传**，任意尺寸都行。
+- 服务端是**中心裁剪**：目标区域尽量居中；原图宽高比和目标（1:1）差太多时边缘会被裁掉。
+- 只支持 `jpeg` / `png`，单张 ≤ 4 MB（`serving.max_image_bytes`）。
+- 分辨率是训练时定死的，**不能只改推理配置**（改 data 配置里的 `shape` 需重新训练）。
+
+### 5.4 不握手的最小调用
+
+跳过 `hello` 时，第一条消息直接发 `infer` 即可，需要自己保证三件事：
+
+1. **鉴权放 URL**：`ws://<host>:8765/v1/ws?token=fastwam-dev-token`
+   （服务端没设 `TOKEN` 时可省略）。
+2. **每次 `infer` 都带 `prompt`**：没有会话默认值可用，缺了返回 `BAD_REQUEST`。
+3. **自己知道相机和维度**：本任务是 `front`、`wrist`（拍这个顺序）、13 维 state、
+   32 步 horizon；不确定就先 `curl /v1/info` 查一次。
+
+```python
+frame = {
+    "v": 1, "type": "infer", "id": "req-0",
+    "prompt": "Plug the charger into the leftmost socket of the power outlet.",
+    "images": [{"format": "jpeg", "data": front_bytes},
+               {"format": "jpeg", "data": wrist_bytes}],  # 省略 key 时按位置：front、wrist
+    "state": state_13,                                    # 13 个原始值
+    "options": {"num_inference_steps": 10},
+}
+await ws.send(msgpack.packb(frame, use_bin_type=True))
+```
+
+响应只有 5.7 的 `actions` 帧（不再有 `hello_ack`）。token 错误或缺失时，第一条
+`infer` 返回 `UNAUTHORIZED` 并以 4401 断开。`hello` 之后仍然可以随时补发，
+重发会覆盖会话默认值。
+
+### 5.5 按需求改哪个字段
 
 | 想做的事 | 改哪里 |
 |---|---|
@@ -433,13 +476,13 @@ wipe the charactor 'T' on the whiteboard at the end of 'CloudRoboT'.
 - 不要传归一化后的 state：要原始未归一化的值。
 - 不要加协议里没有的字段：会直接 `BAD_REQUEST`。
 
-### 5.4 用现成客户端改 body
+### 5.6 用现成客户端改 body
 
 `examples/ws_client.py` 的 CLI 参数就是对 body 字段的映射：
 
 | CLI 参数 | 对应 body 字段 |
 |---|---|
-| `--token` | `hello.token` |
+| `--token` | `hello.token`；加 `--no-handshake` 时自动拼到 URL |
 | `--prompt` | `hello.prompt` 和每次 `infer.prompt` |
 | `--image`（可重复） | `infer.images[i].data`，按出现顺序 |
 | `--synthetic` | 用纯色图替换 `images[*].data` |
@@ -449,6 +492,19 @@ wipe the charactor 'T' on the whiteboard at the end of 'CloudRoboT'.
 | `--sigma-shift` | `options.sigma_shift` |
 | `--repeat` | 同一连接上连发 N 次 `infer` |
 | `--id-prefix` | `infer.id`（`<prefix>-<index>`） |
+| `--no-handshake` | 完全不发 `hello`；此时 `--state` 必须显式给 |
+| `--num-cameras` | 无握手 + `--synthetic` 时生成几张图，默认 2 |
+
+不握手跑一次：
+
+```bash
+python examples/ws_client.py \
+  --url ws://127.0.0.1:8765/v1/ws \
+  --token fastwam-dev-token --no-handshake --synthetic \
+  --state 0,0,0,0,0,0,0,0,0,0,0,0,0 \
+  --prompt "Plug the charger into the leftmost socket of the power outlet." \
+  --repeat 3 --verbose
+```
 
 想完全控制 body 就照 5.2 自己拼 dict，然后：
 
@@ -459,7 +515,7 @@ frame = {...}  # 5.2 里的结构，data 放读出来的图片字节
 await ws.send(msgpack.packb(frame, use_bin_type=True))
 ```
 
-### 5.5 返回什么
+### 5.7 返回什么
 
 ```json
 {
@@ -491,12 +547,63 @@ await ws.send(msgpack.packb(frame, use_bin_type=True))
  "code": "BAD_REQUEST", "message": "invalid infer frame", "detail": "..."}
 ```
 
-除了 `UNSUPPORTED_FORMAT`（首帧错误 / 帧过大）和 `UNAUTHORIZED`，其他错误都不会断开连接，
+除了 `UNSUPPORTED_FORMAT`（未知 `type` / 文本帧 / 帧过大）和 `UNAUTHORIZED`，其他错误都不会断开连接，
 改好 body 继续发即可。完整字段和错误码见 `docs/fastwam_infer-serving_ws_api_zh.md` 第 3 节。
 
 ---
 
-## 6. 机器人侧完整客户端
+## 6. 机器人侧客户端
+
+### 6.1 最小实现（不握手）
+
+相机顺序和维度由客户端自己保证：本任务是 `front`、`wrist`、13 维 state、32 步 horizon。
+
+```python
+import io
+
+import msgpack
+import numpy as np
+from PIL import Image
+from websockets.asyncio.client import connect
+
+URL = "ws://127.0.0.1:8765/v1/ws?token=fastwam-dev-token"   # 鉴权放 URL
+PROMPT = "Plug the charger into the leftmost socket of the power outlet."
+STEPS = 10
+REPLAN_STEPS = 5
+
+
+def jpeg(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+async def run(robot):
+    async with connect(URL, max_size=64 * 1024 * 1024, ping_interval=None) as ws:
+        request_id = 0
+        while True:
+            obs = robot.get_observation()
+            await ws.send(msgpack.packb({
+                "v": 1, "type": "infer", "id": f"req-{request_id}",
+                "prompt": PROMPT,                                # 每次都要带
+                "images": [{"format": "jpeg", "data": jpeg(obs["front"])},
+                           {"format": "jpeg", "data": jpeg(obs["wrist"])}],
+                "state": [float(x) for x in obs["state"]],
+                "options": {"num_inference_steps": STEPS},
+            }, use_bin_type=True))
+
+            resp = msgpack.unpackb(await ws.recv(), raw=False, strict_map_key=False)
+            if resp["type"] == "error":
+                raise RuntimeError(f"{resp['code']}: {resp['message']}")
+            actions = np.asarray(resp["actions"], dtype=np.float32)  # [32, 13]
+            assert np.isfinite(actions).all()
+
+            for action in actions[:REPLAN_STEPS]:
+                robot.step(action)
+            request_id += 1
+```
+
+### 6.2 完整实现（带握手）
 
 `examples/ws_client.py` 是一次性请求的完整实现（body 字段含义见第 5 节）。机器人闭环可以按下面这个模板接
 （把 `robot.get_observation()` / `robot.step()` 换成你的 HSR602 API）：

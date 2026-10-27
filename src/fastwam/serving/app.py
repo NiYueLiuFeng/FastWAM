@@ -112,6 +112,9 @@ def create_app(serve_config: ServeConfig, engine_factory: Callable[[], Any]) -> 
         await websocket.accept()
         session = SessionState()
         query_token = websocket.query_params.get("token")
+        # A matching `?token=` authenticates the connection up front, so clients
+        # that skip `hello` can send `infer` as their first frame.
+        authenticated = _authorized(serve_config, query_token)
 
         async def send(frame: dict[str, Any]) -> None:
             await websocket.send_bytes(pack(frame))
@@ -139,80 +142,90 @@ def create_app(serve_config: ServeConfig, engine_factory: Callable[[], Any]) -> 
             return unpack(data)
 
         try:
-            # ---- handshake -------------------------------------------------
-            payload = await receive_payload()
-            if payload.get("type") != "hello":
-                await send(
-                    error_frame(
-                        request_id=payload.get("id"),
-                        code=UNSUPPORTED_FORMAT,
-                        message="the first frame must be a `hello` message",
-                    )
-                )
-                await websocket.close(code=1002)
-                return
-
-            try:
-                hello = parse_hello(payload)
-            except ProtocolError as exc:
-                await send(
-                    error_frame(request_id=None, code=exc.code, message=exc.message, detail=exc.detail)
-                )
-                await websocket.close(code=1002)
-                return
-
-            provided_token = hello.token or query_token
-            if not _authorized(serve_config, provided_token):
-                await send(
-                    error_frame(
-                        request_id=None, code=UNAUTHORIZED, message="invalid or missing token"
-                    )
-                )
-                await websocket.close(code=_WS_UNAUTHORIZED)
-                return
-
-            session.client = hello.client
-            session.prompt = hello.prompt
-            session.options = {
-                key: value
-                for key, value in hello.options.model_dump().items()
-                if value is not None
-            }
-            logger.info("Session %s connected (client=%s)", session.id, session.client)
-
-            engine = app.state.engine
-            if engine is None:
-                await send(
-                    error_frame(
-                        request_id=None,
-                        code=INTERNAL,
-                        message="model is not ready",
-                        detail=repr(app.state.worker.init_error)
-                        if app.state.worker.init_error
-                        else None,
-                    )
-                )
-                await websocket.close(code=1013)
-                return
-
-            await send(
-                hello_ack(
-                    server=SERVER_NAME,
-                    session_id=session.id,
-                    model_info=engine.model_info,
-                    limits=engine.limits,
-                )
-            )
-
-            # ---- request loop ----------------------------------------------
+            # `hello` is optional: a client that sends `?token=...` and a
+            # `prompt` with every request can start with `infer` directly.
             while True:
                 payload = await receive_payload()
                 message_type = payload.get("type")
                 request_id = payload.get("id")
 
+                if message_type == "hello":
+                    try:
+                        hello = parse_hello(payload)
+                    except ProtocolError as exc:
+                        await send(
+                            error_frame(
+                                request_id=None,
+                                code=exc.code,
+                                message=exc.message,
+                                detail=exc.detail,
+                            )
+                        )
+                        await websocket.close(code=1002)
+                        return
+
+                    if not _authorized(serve_config, hello.token or query_token):
+                        await send(
+                            error_frame(
+                                request_id=None,
+                                code=UNAUTHORIZED,
+                                message="invalid or missing token",
+                            )
+                        )
+                        await websocket.close(code=_WS_UNAUTHORIZED)
+                        return
+                    authenticated = True
+
+                    session.client = hello.client
+                    session.prompt = hello.prompt
+                    session.options = {
+                        key: value
+                        for key, value in hello.options.model_dump().items()
+                        if value is not None
+                    }
+                    logger.info("Session %s connected (client=%s)", session.id, session.client)
+
+                    engine = app.state.engine
+                    if engine is None:
+                        await send(
+                            error_frame(
+                                request_id=None,
+                                code=INTERNAL,
+                                message="model is not ready",
+                                detail=repr(app.state.worker.init_error)
+                                if app.state.worker.init_error
+                                else None,
+                            )
+                        )
+                        await websocket.close(code=1013)
+                        return
+
+                    await send(
+                        hello_ack(
+                            server=SERVER_NAME,
+                            session_id=session.id,
+                            model_info=engine.model_info,
+                            limits=engine.limits,
+                        )
+                    )
+                    continue
+
                 if message_type == "ping":
                     await send({"v": 1, "type": "pong", "ts": payload.get("ts")})
                     continue
+
+                if not authenticated:
+                    await send(
+                        error_frame(
+                            request_id=request_id,
+                            code=UNAUTHORIZED,
+                            message="invalid or missing token",
+                            detail="add ?token=... to the URL or send a hello frame",
+                        )
+                    )
+                    await websocket.close(code=_WS_UNAUTHORIZED)
+                    return
+
                 if message_type == "reset":
                     session.prompt = None
                     session.options = {}
@@ -227,6 +240,21 @@ def create_app(serve_config: ServeConfig, engine_factory: Callable[[], Any]) -> 
                         )
                     )
                     continue
+
+                engine = app.state.engine
+                if engine is None:
+                    await send(
+                        error_frame(
+                            request_id=request_id,
+                            code=INTERNAL,
+                            message="model is not ready",
+                            detail=repr(app.state.worker.init_error)
+                            if app.state.worker.init_error
+                            else None,
+                        )
+                    )
+                    await websocket.close(code=1013)
+                    return
 
                 try:
                     request = parse_infer(payload)

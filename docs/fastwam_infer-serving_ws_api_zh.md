@@ -89,7 +89,8 @@ wss://{host}:{port}/v1/ws?token=… （生产，见第 8 节）
 ```
 
 - 每个 **二进制** 帧 = 一个 msgpack map：`msgpack.packb(obj, use_bin_type=True)`。
-- 所有帧带 `v: 1` 和 `type`；首个客户端帧必须是 `hello`。
+- 所有帧带 `v: 1` 和 `type`。首帧可以是 `hello`（推荐，能拿到模型信息），也可以直接
+  是 `infer`；不握手时鉴权只能用 `?token=`，且每次 `infer` 必须带 `prompt`。
 - 不支持文本帧（返回 `UNSUPPORTED_FORMAT`）。
 - 单帧上限 `serving.max_message_bytes`（默认 16 MiB），超限返回错误并以 close code `1009` 关闭。
 - 只使用 msgpack 的 map / array / str / int / float / bool / bin 六种类型，浮点为 double，
@@ -101,11 +102,16 @@ wss://{host}:{port}/v1/ws?token=… （生产，见第 8 节）
 ### 3.2 鉴权
 
 - 设置环境变量 `FASTWAM_SERVICE_TOKEN` 即启用（`serving.auth_token_env` 可改名）。
-- 客户端通过 `?token=` 查询参数或 `hello.token` 提供，服务端用 `hmac.compare_digest` 比较。
+- 客户端通过 `?token=` 查询参数或 `hello.token` 提供，服务端用 `hmac.compare_digest` 比较；
+  跳过 `hello` 的连接只能用 `?token=`。
 - 未设置该变量时服务照常启动，但会打印警告并允许匿名访问 —— **仅限可信内网 / 开发环境**。
 - 鉴权失败：返回 `UNAUTHORIZED` 错误帧，并以 close code `4401` 关闭。
 
-### 3.3 握手：`hello` → `hello_ack`
+### 3.3 握手（可选）：`hello` → `hello_ack`
+
+`hello` 不是必需的。不发 `hello` 时，会话没有默认 prompt / options，鉴权只能走
+`?token=`，每次 `infer` 必须自带 `prompt`。`hello` 也可以在连接建立后的任意时刻发送
+（重发会覆盖会话默认值）。
 
 客户端 → 服务端：
 
@@ -175,14 +181,15 @@ wss://{host}:{port}/v1/ws?token=… （生产，见第 8 节）
 
 约束：
 
-- `images` 数量必须等于 `hello_ack.model.cameras` 的个数。
-- `images[i].key` 可省略：全部省略时按**位置**对应；给了 key 时按 key 匹配（与顺序无关），
-  缺 key 或 key 不匹配 → `BAD_REQUEST`。
+- `images` 数量必须等于相机个数（`/v1/info` 或 `hello_ack.model.cameras`）。
+- `images[i].key` 可省略：全部省略时按**位置**对应；全部给出时按 key 匹配（与顺序无关）；
+  只给一部分或 key 不匹配 → `BAD_REQUEST`。
 - `format` 只接受 `jpeg` / `jpg` / `png`，服务端用 PIL 解码并校验真实格式；失败 → `BAD_REQUEST`。
 - `state` 长度必须等于 `state_dim`，按 `state_keys` 顺序拼接（服务端始终校验长度）。
   不使用 proprio 的模型在 `hello_ack.model.uses_proprio=false` 时忽略该字段内容，
   但仍需发送占位的 `state_dim` 个值。
-- `prompt` 与 hello 的默认 prompt 二选一，都缺失 → `BAD_REQUEST`。
+- `prompt` 与 hello 的默认 prompt 二选一，都缺失 → `BAD_REQUEST`；不握手时每次
+  `infer` 都必须带 `prompt`。
 - `options` 中为 `None` 的字段回退到 hello 的会话默认值，再回退到服务端配置。
 - `timeout_ms` 是「排队 + 推理」的总预算，超时返回 `TIMEOUT`（后台线程无法强杀，
   该次计算仍会跑完，结果丢弃）。
@@ -226,13 +233,14 @@ wss://{host}:{port}/v1/ws?token=… （生产，见第 8 节）
 | code | 触发场景 | 连接是否保持 |
 |---|---|---|
 | `BAD_REQUEST` | msgpack 解码失败、字段缺失/类型错误、图片数量/格式/state 维度不符、缺少 prompt | 保持 |
-| `UNSUPPORTED_FORMAT` | 文本帧、未知 `type`、首帧不是 `hello`、帧过大 | 首帧错误 / 帧过大时关闭 |
+| `UNSUPPORTED_FORMAT` | 文本帧、未知 `type`、帧过大 | 帧过大时关闭 |
 | `UNAUTHORIZED` | token 缺失或错误 | 关闭（4401） |
 | `BUSY` | 队列已满（`limits.queue_depth`） | 保持 |
 | `TIMEOUT` | 排队 + 推理超过 `timeout_ms` | 保持 |
 | `INTERNAL` | 推理异常（服务端记录 traceback） | 保持 |
 
-连接建立但模型未就绪时，握手返回 `INTERNAL: model is not ready` 并关闭（1013）。
+模型未就绪时，`hello` 或第一条 `infer` 返回 `INTERNAL: model is not ready` 并关闭（1013）。
+`UNAUTHORIZED` 在 `hello` 或（未握手时）第一条 `infer` 时触发。
 
 ---
 
@@ -438,6 +446,12 @@ python examples/ws_client.py \
 
 # 传输层联调 / 压测
 python examples/ws_client.py --synthetic --prompt "pick up the cube" --repeat 50
+
+# 不握手：token 拼到 URL，prompt 每次 infer 带
+python examples/ws_client.py --no-handshake --token "$TOKEN" \
+  --image cam_high.jpg --image cam_wrist.jpg \
+  --state 0.1,0.2,0.3,0.0,0.0,0.0,0.04,0.04 \
+  --prompt "put the bowl on the plate"
 ```
 
 最小 Python 客户端：
@@ -466,6 +480,22 @@ async def main():
         if resp["type"] == "error":
             raise RuntimeError(f"{resp['code']}: {resp['message']}")
         actions = resp["actions"]             # [horizon][action_dim]
+```
+
+不握手的最小客户端（token 只能走 `?token=`，`prompt` 每次都要带，图片按位置对应）：
+
+```python
+async def main():
+    async with connect("ws://127.0.0.1:8765/v1/ws?token=TOKEN") as ws:
+        await ws.send(pack({
+            "v": 1, "type": "infer", "id": "t0",
+            "prompt": "pick up the cube",
+            "images": [{"format": "jpeg", "data": cam_high_bytes},
+                       {"format": "jpeg", "data": cam_wrist_bytes}],
+            "state": state.tolist(),
+        }))
+        resp = unpack(await ws.recv())
+        actions = resp["actions"]
 ```
 
 ---
@@ -508,7 +538,7 @@ CUDA graph 的状态。
 |---|---|
 | `/readyz` 一直 503 | 看服务日志：权重路径、`dataset_stats.json`、显存不足、`torch.compile` 失败 |
 | `CUDA error: no kernel image is available` | torch 版本不含该 GPU 架构的 kernel（典型：cu126 + RTX 5090/sm_120），换 cu128 wheel |
-| 握手返回 `INTERNAL: model is not ready` | 初始化失败；`/readyz` 的 `error` 字段有异常摘要 |
+| `INTERNAL: model is not ready`（hello 或首条 infer） | 初始化失败；`/readyz` 的 `error` 字段有异常摘要 |
 | `BAD_REQUEST: expected N images` | 图片数量与 `hello_ack.model.cameras` 不一致 |
 | `BAD_REQUEST: state must have N values` | state 维度与 `state_dim` 不一致（注意多 key 拼接顺序） |
 | 动作尺度明显不对 | 检查 `dataset_stats_path` 是否与 checkpoint 匹配；检查 `sigma_shift`、`action_horizon` |

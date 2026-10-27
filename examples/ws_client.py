@@ -15,6 +15,12 @@ Examples:
 
     # benchmark: 20 sequential requests, prints p50/p95 latency
     python examples/ws_client.py --synthetic --prompt "pick up the cube" --repeat 20
+
+    # skip the hello handshake: token goes in the URL, prompt in every infer
+    python examples/ws_client.py --no-handshake --token t0k3n \
+        --image cam_high.jpg --image cam_wrist.jpg \
+        --state 0.1,0.2,0.3,0.0,0.0,0.0,0.04,0.04 \
+        --prompt "put the bowl on the plate"
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import json
 import statistics
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import msgpack
 import numpy as np
@@ -62,7 +69,10 @@ def synthetic_images(cameras: list[dict]) -> list[dict]:
         array[..., index % 3] = 200
         buffer = io.BytesIO()
         Image.fromarray(array).save(buffer, format="JPEG", quality=90)
-        images.append({"key": camera["key"], "format": "jpeg", "data": buffer.getvalue()})
+        payload = {"format": "jpeg", "data": buffer.getvalue()}
+        if camera.get("key") is not None:
+            payload["key"] = camera["key"]
+        images.append(payload)
     return images
 
 
@@ -91,26 +101,43 @@ async def run(args) -> None:
     images = [load_image(path) for path in args.image]
     state = parse_state(args.state)
 
-    async with connect(args.url, max_size=args.max_size, ping_interval=None) as ws:
-        hello = {"v": 1, "type": "hello", "client": "ws_client"}
-        if args.token:
-            hello["token"] = args.token
-        if args.prompt:
-            hello["prompt"] = args.prompt
-        await ws.send(pack(hello))
+    # Without a hello frame there is no place to put the token, so send it in
+    # the query string (the server accepts either).
+    url = args.url
+    if args.no_handshake and args.token:
+        url += ("&" if "?" in url else "?") + f"token={quote(args.token)}"
 
-        ack = unpack(await ws.recv())
-        if ack.get("type") != "hello_ack":
-            raise RuntimeError(f"handshake failed: {ack}")
-        if args.verbose:
-            print(json.dumps(ack, indent=2, ensure_ascii=False))
+    async with connect(url, max_size=args.max_size, ping_interval=None) as ws:
+        ack = None
+        cameras = None
+        if not args.no_handshake:
+            hello = {"v": 1, "type": "hello", "client": "ws_client"}
+            if args.token:
+                hello["token"] = args.token
+            if args.prompt:
+                hello["prompt"] = args.prompt
+            await ws.send(pack(hello))
 
-        cameras = ack["model"]["cameras"]
+            ack = unpack(await ws.recv())
+            if ack.get("type") != "hello_ack":
+                raise RuntimeError(f"handshake failed: {ack}")
+            if args.verbose:
+                print(json.dumps(ack, indent=2, ensure_ascii=False))
+
+            cameras = ack["model"]["cameras"]
+
         if args.synthetic or not images:
-            images = synthetic_images(cameras)
-        if len(images) != len(cameras):
+            if cameras is not None:
+                images = synthetic_images(cameras)
+            else:
+                images = synthetic_images(
+                    [{"key": None, "shape": [3, 224, 224]}] * args.num_cameras
+                )
+        if cameras is not None and len(images) != len(cameras):
             raise SystemExit(f"expected {len(cameras)} images, got {len(images)}")
         if not state:
+            if ack is None:
+                raise SystemExit("--no-handshake requires --state")
             state = [0.0] * int(ack["model"]["state_dim"])
 
         options = {"num_inference_steps": args.steps}
@@ -134,7 +161,8 @@ async def run(args) -> None:
                 )
 
         actions = np.asarray(last["actions"], dtype=np.float32)
-        assert actions.ndim == 2 and actions.shape[1] == ack["model"]["action_dim"]
+        action_dim = ack["model"]["action_dim"] if ack else last["action_dim"]
+        assert actions.ndim == 2 and actions.shape[1] == action_dim
         assert np.isfinite(actions).all()
 
         if args.output:
@@ -165,6 +193,17 @@ def main() -> None:
     parser.add_argument("--token", default=None)
     parser.add_argument("--image", action="append", default=[], help="camera image path (repeatable)")
     parser.add_argument("--synthetic", action="store_true", help="send generated images instead of files")
+    parser.add_argument(
+        "--no-handshake",
+        action="store_true",
+        help="skip the hello frame; token goes in ?token= and prompt in every infer",
+    )
+    parser.add_argument(
+        "--num-cameras",
+        type=int,
+        default=2,
+        help="synthetic camera count when --no-handshake is used",
+    )
     parser.add_argument("--state", default=None, help="comma separated raw state")
     parser.add_argument("--prompt", default="pick up the object")
     parser.add_argument("--steps", type=int, default=10)
