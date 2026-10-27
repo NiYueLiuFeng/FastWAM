@@ -1,4 +1,5 @@
-# FastWAM training / inference / LIBERO-eval image (x86_64).
+# FastWAM training / inference image (x86_64). LIBERO is NOT installed: mount
+# a LIBERO checkout at runtime if you need the simulation evaluation env.
 #
 # Host driver requirement: any CUDA 12.x driver (>= 525, e.g. a 12.1-era ~530 driver).
 # The torch cu126 wheels bundle their own CUDA runtime and work on all 12.x drivers
@@ -44,7 +45,8 @@ RUN sed -i \
 # ---------------------------------------------------------------------------
 # 1) System packages + Python 3.12
 #    - ffmpeg: video decoding (torchcodec requires system FFmpeg libs)
-#    - EGL/OpenGL stack: LIBERO OffScreenRenderEnv (MUJOCO_GL=egl)
+#    - EGL/OpenGL stack: offscreen rendering (MUJOCO_GL=egl), used by a
+#      LIBERO checkout mounted at runtime rather than installed here
 #    - build-essential / ninja: DeepSpeed JIT compilation
 #    - Python 3.12 via deadsnakes (pyproject requires >=3.12; Ubuntu 22.04
 #      ships 3.10)
@@ -98,23 +100,20 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
     TORCHINDUCTOR_CACHE_DIR=/workspace/home/.torchinductor
 
 # Writable $HOME so the image also works with `docker run --user $(id -u):$(id -g)`:
-# torch inductor/triton, wandb and LIBERO all write under it. Mounting a host
+# torch inductor/triton and wandb all write under it. Mounting a host
 # directory over this path keeps that directory's own ownership instead.
 RUN mkdir -p /workspace/home && chmod 777 /workspace/home
 
 WORKDIR /workspace/FastWAM
 
 # ---------------------------------------------------------------------------
-# 5) FastWAM + LIBERO + sanity check
+# 5) FastWAM + sanity check
 #    FastWAM code is baked into the image; data/checkpoints/runs are mounted.
 #    The local version tags (+cu128) are stripped inside the image only, so the
 #    installed cu126 wheels satisfy the pins. The repo file is left untouched.
 #
-#    LIBERO is the simulation environment for evaluation. Installed with
-#    --no-deps so LIBERO's (older) requirements cannot downgrade fastwam's
-#    pinned stack (numpy / transformers / etc.); its runtime deps are added
-#    explicitly instead. mujoco is installed last to stay at 3.3.2 (must match
-#    the LIBERO dataset version, per the README).
+#    LIBERO is deliberately not installed (robosuite/mujoco/bddl etc. are
+#    LIBERO-only deps). Mount a LIBERO checkout at runtime if you need it.
 #
 #    The layer ends with a build-time sanity check: dependency graph
 #    consistent, key packages importable.
@@ -125,55 +124,13 @@ RUN sed -i \
       -e 's/torchvision==0\.22\.1+cu128/torchvision==0.22.1/' \
       /workspace/FastWAM/pyproject.toml \
   && grep -n 'torch==' /workspace/FastWAM/pyproject.toml \
-  && pip install --no-cache-dir --retries 10 -e '/workspace/FastWAM[serving]'
-
-# LIBERO's top-level `libero/` dir has no __init__.py (namespace package), so
-# PEP 660 strict editable installs don't expose it: `import libero` fails unless
-# the repo root is on sys.path. Put it on PYTHONPATH (also valid at runtime).
-ENV PYTHONPATH=/opt/LIBERO
-
-# LIBERO in its own layer so fastwam's install stays cached across rebuilds.
-# Fetched as a codeload tarball instead of git clone: the container->github.com
-# route is intermittent (curl 16 HTTP/2 framing errors, connect timeouts),
-# while codeload.github.com serves reliably; the retry loop absorbs hiccups.
-RUN for i in 1 2 3 4 5; do \
-      wget -q --tries=3 --timeout=60 -O /tmp/libero.tar.gz \
-        https://codeload.github.com/Lifelong-Robot-Learning/LIBERO/tar.gz/refs/heads/master && break; \
-      echo "libero download retry $i"; sleep $((i * 15)); \
-    done && test -s /tmp/libero.tar.gz \
-  && mkdir -p /opt/LIBERO \
-  && tar xzf /tmp/libero.tar.gz -C /opt/LIBERO --strip-components=1 \
-  && rm /tmp/libero.tar.gz \
-  && pip install --no-cache-dir --retries 10 --no-deps -e /opt/LIBERO \
-  && pip install --no-cache-dir \
-    pyquaternion \
-    easydict \
-    pypng \
-    pygame \
-  && pip install --no-cache-dir --no-deps robosuite==1.4.1 \
-  && pip install --no-cache-dir numba scipy pynput opencv-python \
-  && pip install --no-cache-dir bddl==1.0.1 future pyparsing matplotlib cloudpickle "gym==0.25.2" \
-  && pip install --no-cache-dir mujoco==3.3.2 \
-  && mkdir -p /opt/LIBERO/libero/datasets /opt/libero-config /root/.libero \
-  && python -c "import yaml; root='/opt/LIBERO/libero/libero'; yaml.dump({'benchmark_root': root, 'bddl_files': root+'/bddl_files', 'init_states': root+'/init_files', 'datasets': '/opt/LIBERO/libero/datasets', 'assets': root+'/assets'}, open('/opt/libero-config/config.yaml','w'))" \
-  && cp /opt/libero-config/config.yaml /root/.libero/config.yaml \
-  && chmod -R a+rX /opt/libero-config \
+  && pip install --no-cache-dir --retries 10 -e '/workspace/FastWAM[serving]' \
   && pip check \
   && python -c "import torch, torchvision, fastwam, deepspeed, av, torchcodec; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
-  && python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok')" \
-  && python -c "from libero.libero import benchmark; from libero.libero.envs import OffScreenRenderEnv; print('libero ok')"
+  && python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok')"
 
 # WebSocket inference service port (see docs/serving_ws_api_zh.md).
 EXPOSE 8765
-
-# Seed ~/.libero/config.yaml into whatever $HOME the container starts with, so
-# non-root runs (`--user <uid>:<gid>`) keep LIBERO working. Copied from the
-# build context rather than symlinked into /workspace/FastWAM: that path is
-# usually shadowed by a bind mount at runtime.
-COPY scripts/container_entrypoint.sh /usr/local/bin/fastwam-entrypoint
-RUN chmod 755 /usr/local/bin/fastwam-entrypoint
-
-ENTRYPOINT ["/usr/local/bin/fastwam-entrypoint"]
 
 # Default command: an interactive shell. See docker/run_container.sh for the
 # recommended run invocation (GPU, shm, volume mounts).

@@ -1,7 +1,7 @@
 # FastWAM Docker 使用说明
 
 面向 **x86_64 + CUDA 12.x 驱动（≥ 525，包括只支持到 CUDA 12.1 的 ~530 驱动）** 机器的
-训练 / 推理 / LIBERO 评测一体化镜像。
+训练 / 推理一体化镜像（不含 LIBERO，做仿真评测时自行挂载 LIBERO 代码）。
 
 ## 镜像设计要点
 
@@ -11,8 +11,9 @@
 - **devel 基础镜像**（含 nvcc 12.6）：DeepSpeed 的 op 在首次训练时 JIT 编译需要编译器。
   首次训练会多花几分钟编译，之后缓存到 `/root/.cache/torch_extensions/`。
 - **代码打进镜像**（`/workspace/FastWAM`），数据 / 权重 / 训练输出全部挂载。
-- **LIBERO 评测环境**已装好（`/opt/LIBERO` + `mujoco==3.3.2`，EGL 离屏渲染）。
-  LIBERO 以 `--no-deps` 方式安装，避免它的旧依赖降级 fastwam 锁定的包。
+- **不安装 LIBERO**：镜像只含训练 / 推理依赖。做 LIBERO 评测时，把 LIBERO 代码挂进容器
+  （如 `-v /path/to/LIBERO:/opt/LIBERO`）并自行安装其运行依赖；镜像已带 EGL/OpenGL 系统库
+  （`MUJOCO_GL=egl`），支持无显示器离屏渲染。
 
 ## 1. 构建镜像
 
@@ -107,9 +108,9 @@ python experiments/libero/run_libero_manager.py \
 docker run --rm --gpus all fastwam:cu126 \
   python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
 
-# LIBERO 导入 + EGL（无显示器离屏渲染）
+# serving 依赖 + fastwam 导入
 docker run --rm --gpus all fastwam:cu126 \
-  python -c "from libero.libero.envs import OffScreenRenderEnv; print('libero egl ok')"
+  python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok')"
 ```
 
 进入容器后可用 `scripts/dryrun_fastwam.py` 验证模型推理链路，
