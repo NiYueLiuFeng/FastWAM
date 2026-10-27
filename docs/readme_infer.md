@@ -36,10 +36,11 @@
 - [2. 容器内自检](#2-容器内自检)
 - [3. 启动推理服务](#3-启动推理服务)
 - [4. 验证服务](#4-验证服务)
-- [5. 机器人侧完整客户端](#5-机器人侧完整客户端)
-- [6. 后台常驻与停止](#6-后台常驻与停止)
-- [7. 常见问题](#7-常见问题)
-- [8. 最短路径总结](#8-最短路径总结)
+- [5. 请求 body 示例](#5-请求-body-示例)
+- [6. 机器人侧完整客户端](#6-机器人侧完整客户端)
+- [7. 后台常驻与停止](#7-后台常驻与停止)
+- [8. 常见问题](#8-常见问题)
+- [9. 最短路径总结](#9-最短路径总结)
 
 ---
 
@@ -306,9 +307,198 @@ python examples/ws_client.py \
 
 ---
 
-## 5. 机器人侧完整客户端
+## 5. 请求 body 示例
 
-`examples/ws_client.py` 是一次性请求的完整实现。机器人闭环可以按下面这个模板接
+服务端没有 HTTP 那种 URL + JSON body：**每一帧就是一个 msgpack map**
+（`msgpack.packb(frame, use_bin_type=True)`），走 WebSocket 二进制帧。
+下面用 JSON 展示帧的**结构**只是方便阅读，实际发送必须用 msgpack 编码，
+并且 `images[i].data` 放的是**图片文件的原始字节**，不是 base64 字符串。
+
+两个最容易踩的约束：
+
+- **不能拼错字段名，也不能多加字段**。请求模型是 pydantic `extra="forbid"`，
+  多一个未知键（比如 `image` 写成 `images`、`num_steps` 写成 `num_inference_steps`）
+  会直接返回 `BAD_REQUEST: invalid infer frame`。
+- 每条连接**先发一帧 `hello`**，之后才发 `infer`；把 `infer` 当第一帧发会被
+  `UNSUPPORTED_FORMAT` 关掉。
+
+### 5.1 `hello`：建连后的第一帧
+
+```json
+{
+  "v": 1,
+  "type": "hello",
+  "token": "fastwam-dev-token",
+  "client": "hsr602",
+  "prompt": "Plug the charger into the leftmost socket of the power outlet.",
+  "options": {
+    "num_inference_steps": 10
+  }
+}
+```
+
+| 字段 | 必填 | 说明 | 本任务取值 |
+|---|---|---|---|
+| `v` | 是 | 协议版本，固定 `1` | `1` |
+| `type` | 是 | 固定 `"hello"` | `"hello"` |
+| `token` | 否 | 服务端设了 `TOKEN` 才需要；也可以放在 URL `?token=...` | `fastwam-dev-token` |
+| `client` | 否 | 客户端标识，只进日志 | 任意 |
+| `prompt` | 否 | 会话默认指令；`infer` 里带 `prompt` 时会覆盖它，所以只跑固定任务时才需要填 | 见下方两条指令 |
+| `options` | 否 | 会话默认推理参数，字段同 5.2 的 `options` | `{"num_inference_steps": 10}` |
+
+`prompt` 必须是当前场景对应的指令，这个 checkpoint 只认这两条：
+
+```text
+Plug the charger into the leftmost socket of the power outlet.
+wipe the charactor 'T' on the whiteboard at the end of 'CloudRoboT'.
+```
+
+### 5.2 `infer`：每次推理一帧
+
+```json
+{
+  "v": 1,
+  "type": "infer",
+  "id": "req-000123",
+  "prompt": "Plug the charger into the leftmost socket of the power outlet.",
+  "images": [
+    {"key": "front", "format": "jpeg", "data": "<front.jpg 的原始字节>"},
+    {"key": "wrist", "format": "jpeg", "data": "<wrist.jpg 的原始字节>"}
+  ],
+  "state": [
+    0.4123, -0.0021, 0.3012,
+    0.0110, -0.0004, 0.0521,
+    0.0620,
+    0.0000, 0.0000, -1.2345,
+    0.0021, -0.0451, 0.0000
+  ],
+  "options": {
+    "num_inference_steps": 10
+  }
+}
+```
+
+（`state` 里的数值只是占位示例，别人的机器人要填自己的真实观测。）
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `v` | 是 | 固定 `1` |
+| `type` | 是 | 固定 `"infer"` |
+| `id` | 是 | `str` 或 `int`，服务端在 `actions` / `error` 里原样回传，用来对请求 |
+| `prompt` | 否 | 本次请求的任务指令；**每次 `infer` 都可以传**，覆盖 `hello.prompt`；不带则用会话默认值，两处都缺 → `BAD_REQUEST` |
+| `images` | 是 | 数组，长度必须等于 `hello_ack.model.cameras` 的个数（本任务 2） |
+| `images[i].key` | 否 | `"front"` / `"wrist"`；全部省略则按数组**位置**对应，全部给出则按 key 匹配；只给一部分 → `BAD_REQUEST` |
+| `images[i].format` | 否 | `jpeg` / `jpg` / `png`，默认 `jpeg`；服务端用 PIL 解码并校验真实格式 |
+| `images[i].data` | 是 | 图片原始字节（msgpack bin 类型），单张上限 `limits.max_image_bytes`（默认 4 MB） |
+| `state` | 是 | 13 个**未归一化**的原始值，长度必须等于 13 |
+| `options` | 否 | 见下表；为 `None` 的字段依次回退到 hello options、服务端配置 |
+
+`options` 可调项：
+
+| 字段 | 范围 | 说明 |
+|---|---|---|
+| `num_inference_steps` | 1–200 | 去噪步数，默认 10（和服务端 `STEPS` 一致） |
+| `sigma_shift` | (0, 100] | 默认 `null`，用 scheduler 默认值 |
+| `seed` | ≥ 0 | 固定后动作可复现 |
+| `action_horizon` | 1–1024 | 默认 32，和训练一致，一般不改 |
+| `timeout_ms` | 1–600000 | 单次「排队 + 推理」的总预算，默认取服务端 `REQUEST_TIMEOUT_MS` |
+
+补充约束：
+
+- 整帧上限 `serving.max_message_bytes`（默认 16 MB），超了连接会被关闭（1009）。
+- 图片**不用自己 resize / 裁剪 / 横拼**：服务端按 `cameras[].shape` 处理，再拼成 `224x448`。
+- 不写 key 时，图片顺序必须是 **front、wrist**，传反了动作会明显不对。
+- `state` 13 维和输出动作 13 维的顺序见第 6 节「动作语义」。
+- 任务指令在每次 `infer` 里传 `prompt` 即可，同一条连接上切换任务**不需要重连**。
+  相同 prompt 会命中服务端 LRU 缓存（`timing.text_ms ≈ 0`）；新 prompt 第一次会
+  多一次文本编码开销。
+
+### 5.3 按需求改哪个字段
+
+| 想做的事 | 改哪里 |
+|---|---|
+| 换场景 / 任务指令 | 每次 `infer.prompt`（最灵活）；固定任务也可以只在 `hello.prompt` 设一次 |
+| 换一帧观测图 | 替换 `images[0].data`（front）、`images[1].data`（wrist） |
+| 换成 PNG | `images[i].format = "png"`，`data` 放 PNG 字节 |
+| 换机器人状态 | 整体替换 `state`，必须 13 个原始值 |
+| 不写 key，按位置传 | 删掉**所有** `images[i].key`（只删一部分会报错） |
+| 调推理速度 / 质量 | `options.num_inference_steps`（小更快、大更慢） |
+| 让动作可复现 | `options.seed = 1234` |
+| 放宽单次超时 | `options.timeout_ms = 20000` |
+| 同一条连接切到另一个任务 | 下一次 `infer` 换成新的 `prompt`，不用重连 |
+
+不要做的事：
+
+- 不要把图片转成 base64 / data URL：`data` 必须是原始字节。
+- 不要传归一化后的 state：要原始未归一化的值。
+- 不要加协议里没有的字段：会直接 `BAD_REQUEST`。
+
+### 5.4 用现成客户端改 body
+
+`examples/ws_client.py` 的 CLI 参数就是对 body 字段的映射：
+
+| CLI 参数 | 对应 body 字段 |
+|---|---|
+| `--token` | `hello.token` |
+| `--prompt` | `hello.prompt` 和每次 `infer.prompt` |
+| `--image`（可重复） | `infer.images[i].data`，按出现顺序 |
+| `--synthetic` | 用纯色图替换 `images[*].data` |
+| `--state` | `infer.state` |
+| `--steps` | `options.num_inference_steps` |
+| `--seed` | `options.seed` |
+| `--sigma-shift` | `options.sigma_shift` |
+| `--repeat` | 同一连接上连发 N 次 `infer` |
+| `--id-prefix` | `infer.id`（`<prefix>-<index>`） |
+
+想完全控制 body 就照 5.2 自己拼 dict，然后：
+
+```python
+import msgpack
+
+frame = {...}  # 5.2 里的结构，data 放读出来的图片字节
+await ws.send(msgpack.packb(frame, use_bin_type=True))
+```
+
+### 5.5 返回什么
+
+```json
+{
+  "v": 1,
+  "type": "actions",
+  "id": "req-000123",
+  "actions": [[0.01, "…共 13 个 float…"], "…共 32 行…"],
+  "action_horizon": 32,
+  "action_dim": 13,
+  "action_keys": ["default"],
+  "space": {"state": "dataset observation.state", "action": "dataset action"},
+  "seed_used": null,
+  "timing": {
+    "queue_ms": 0.2,
+    "preprocess_ms": 2.1,
+    "text_ms": 0.0,
+    "infer_ms": 88.5,
+    "postprocess_ms": 0.6,
+    "total_ms": 101.7
+  },
+  "server_ts": 1760000000.123
+}
+```
+
+失败时返回：
+
+```json
+{"v": 1, "type": "error", "id": "req-000123",
+ "code": "BAD_REQUEST", "message": "invalid infer frame", "detail": "..."}
+```
+
+除了 `UNSUPPORTED_FORMAT`（首帧错误 / 帧过大）和 `UNAUTHORIZED`，其他错误都不会断开连接，
+改好 body 继续发即可。完整字段和错误码见 `docs/fastwam_infer-serving_ws_api_zh.md` 第 3 节。
+
+---
+
+## 6. 机器人侧完整客户端
+
+`examples/ws_client.py` 是一次性请求的完整实现（body 字段含义见第 5 节）。机器人闭环可以按下面这个模板接
 （把 `robot.get_observation()` / `robot.step()` 换成你的 HSR602 API）：
 
 ```python
@@ -343,7 +533,7 @@ def to_jpeg(image: Image.Image, quality: int = 90) -> bytes:
 
 async def run(robot):
     async with connect(URL, max_size=64 * 1024 * 1024, ping_interval=None) as ws:
-        # 1) 握手：把 prompt 放到 hello 里，服务端会缓存文本 embedding
+        # 1) 握手：prompt 放 hello 里当默认值（也可以省略，改由下面每次 infer 传）
         await ws.send(pack({
             "v": 1, "type": "hello",
             "token": TOKEN,
@@ -368,6 +558,7 @@ async def run(robot):
 
             req = {
                 "v": 1, "type": "infer", "id": f"req-{request_id}",
+                "prompt": PROMPT,        # 每次都能传；任务变了就改这里，不用重连
                 "images": images,
                 "state": [float(x) for x in obs["state"]],
                 "options": {"num_inference_steps": NUM_STEPS},
@@ -411,7 +602,7 @@ if __name__ == "__main__":
 
 ---
 
-## 6. 后台常驻与停止
+## 7. 后台常驻与停止
 
 调试好后改成后台运行（脚本会等 `/readyz` 就绪再返回）：
 
@@ -440,7 +631,7 @@ kill "$(cat /workspace/FastWAM/runs/serve_logs/charger_white.pid)"
 
 ---
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 处理 |
 |---|---|
@@ -460,7 +651,7 @@ kill "$(cat /workspace/FastWAM/runs/serve_logs/charger_white.pid)"
 
 ---
 
-## 8. 最短路径总结
+## 9. 最短路径总结
 
 ```bash
 # 宿主机
