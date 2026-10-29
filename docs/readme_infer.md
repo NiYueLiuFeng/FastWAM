@@ -88,6 +88,21 @@ bash /mnt/sfs_turbo/h00672373/code/docker/run_container.sh
 - 容器名会是 `fastwam-serve`。如果已存在同名容器，先 `docker rm -f fastwam-serve`。
 - `--network=host` 已由脚本设置，所以宿主机直接访问 `127.0.0.1:8765`。
 
+
+容器内安装依赖
+```
+docker exec -u 0 f756f68a004f bash -c 'cat >> /etc/profile.d/proxy.sh <<EOF
+export https_proxy=http://127.0.0.1:17897
+export http_proxy=http://127.0.0.1:17897
+export no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+EOF'
+
+## 宿主机外直接安装
+docker exec -u 0 f756f68a004f bash -lc '
+export https_proxy=http://127.0.0.1:17897 http_proxy=http://127.0.0.1:17897 all_proxy=http://127.0.0.1:17897
+pip install uvicorn'
+```
+
 ---
 
 ## 2. 容器内自检
@@ -248,7 +263,7 @@ python examples/ws_client.py \
 从训练数据里抽第一帧和对应 state：
 
 ```bash
-DS=/workspace/data/hs_data_v30/lerobot_charger_0324
+DS=/mnt/sfs_turbo/h00672373/train_data/hs_data_v30/lerobot_charger_0324
 mkdir -p /tmp/fastwam_obs
 
 ffmpeg -y -loglevel error -ss 0 \
@@ -262,7 +277,7 @@ ffmpeg -y -loglevel error -ss 0 \
 STATE=$(python - <<'PY'
 import pandas as pd
 df = pd.read_parquet(
-    '/workspace/data/hs_data_v30/lerobot_charger_0324/data/chunk-000/file-000.parquet',
+    '/mnt/sfs_turbo/h00672373/train_data/hs_data_v30/lerobot_charger_0324/data/chunk-000/file-000.parquet',
     columns=['observation.state'],
 )
 print(','.join(f'{x:.8f}' for x in df.iloc[0]['observation.state']))
