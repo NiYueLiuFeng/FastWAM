@@ -95,6 +95,25 @@ is_false() {
 command -v "${PYTHON_BIN}" >/dev/null 2>&1 \
   || die "找不到解释器 ${PYTHON_BIN}（可用 PYTHON_BIN=/path/to/venv/bin/python 指定）"
 
+# serving 依赖（pyproject 的 [serving] extra）。缺 websockets/wsproto 时 uvicorn
+# 不会报错，而是把 /v1/ws 的升级请求当普通 GET 处理，客户端只会看到
+# `InvalidStatus: HTTP 404`；在这里提前拦下来。
+"${PYTHON_BIN}" - <<'PY' || die "serving 依赖不完整：在仓库根目录执行 python -m pip install -e '.[serving]' 后重试"
+import importlib
+import sys
+
+for name in ("fastapi", "uvicorn", "msgpack"):
+    try:
+        importlib.import_module(name)
+    except ImportError as exc:
+        sys.exit(f"missing module: {name} ({exc})")
+
+from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+
+if AutoWebSocketsProtocol is None:
+    sys.exit("uvicorn 找不到 WebSocket 后端（缺 websockets / wsproto）")
+PY
+
 [[ -f "${REPO_ROOT}/configs/serve.yaml" ]] || die "仓库不完整：缺少 configs/serve.yaml"
 [[ -f "${REPO_ROOT}/configs/task/${TASK}.yaml" ]] \
   || die "找不到任务配置 configs/task/${TASK}.yaml（TASK=${TASK}）"
