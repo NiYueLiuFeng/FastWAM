@@ -182,6 +182,7 @@ action_dit_pretrained_path: null
 ```bash
 cd /workspace/FastWAM
 
+## huashu
 export TASK=autogen_mixed_charger_white
 export CKPT=/workspace/FastWAM/runs/autogen_mixed_charger_white/2026-10-23_11-40-22/checkpoints/weights/step_020000.pt
 export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_charger_white/2026-10-23_11-40-22/dataset_stats.json
@@ -192,6 +193,25 @@ export CKPT=/workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-27_02-19-37/checkp
 export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-27_02-19-37/dataset_stats.json
 
 
+## guodi
+export TASK=autogen_mixed_guodi_wrc
+export CKPT=/workspace/FastWAM/runs/autogen_mixed_guodi_wrc/2026-10-30_07-43-00/checkpoints/weights/step_030000.pt
+export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_guodi_wrc/2026-10-30_07-43-00/dataset_stats.json
+
+
+
+## flexi
+export TASK=autogen_mixed_lerobot_v30_flexiv_hz_union_v1
+export CKPT=/workspace/FastWAM/runs/autogen_mixed_lerobot_v30_flexiv_hz_union_v1/2026-10-28_10-18-11/checkpoints/weights/step_030000.pt
+export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_lerobot_v30_flexiv_hz_union_v1/2026-10-28_10-18-11/dataset_stats.json
+
+
+## xingsong
+export TASK=autogen_mixed_guodi_wrc
+export CKPT=/workspace/FastWAM/runs/autogen_mixed_xingsong_resort_join_gripper/2026-10-26_11-15-32/checkpoints/weights/step_030000.pt
+export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_xingsong_resort_join_gripper/2026-10-26_11-15-32/dataset_stats.json
+
+############################## 启动指令
 export GPU=0
 export PORT=8765
 export STEPS=10
