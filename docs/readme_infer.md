@@ -76,7 +76,7 @@ HOST_HOME_DIR=/mnt/sfs_turbo/h00672373/docker_dir/container_home_serve \
 GPUS='"device=0"' \
 NAME=serve \
 EXTRA_DOCKER_ARGS='-v /mnt/sfs_turbo/h00672373/github/FastWAM:/workspace/FastWAM' \
-bash /mnt/sfs_turbo/h00672373/code/docker/run_container.sh
+bash ./docker/run_container.sh
 ```
 
 几点说明：
@@ -832,7 +832,7 @@ HOST_HF_CACHE=/mnt/sfs_turbo/h00672373/docker_dir/hf_cache \
 HOST_HOME_DIR=/mnt/sfs_turbo/h00672373/docker_dir/container_home_serve \
 GPUS='"device=0"' NAME=serve \
 EXTRA_DOCKER_ARGS='-v /mnt/sfs_turbo/h00672373/github/FastWAM:/workspace/FastWAM' \
-bash /mnt/sfs_turbo/h00672373/code/docker/run_container.sh
+bash ./docker/run_container.sh
 
 # 容器内
 cd /workspace/FastWAM
