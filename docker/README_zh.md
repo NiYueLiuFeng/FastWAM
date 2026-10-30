@@ -11,6 +11,11 @@
 - **devel 基础镜像**（含 nvcc 12.6）：DeepSpeed 的 op 在首次训练时 JIT 编译需要编译器。
   首次训练会多花几分钟编译，之后缓存到 `/root/.cache/torch_extensions/`。
 - **代码打进镜像**（`/workspace/FastWAM`），数据 / 权重 / 训练输出全部挂载。
+- **含推理服务依赖**：构建时 `pip install -e '.[serving]'`，镜像自带
+  `fastapi` / `uvicorn[standard]` / `msgpack` / `websockets`，容器内可直接
+  `bash scripts/serve_deploy.sh` 起 WebSocket 服务。构建结束会断言 uvicorn
+  确实能挑到 WebSocket 后端——早于这项检查的旧镜像没有这些包，
+  表现为 `/v1/ws` 返回 HTTP 404 并打印 `No supported WebSocket library detected`。
 - **不安装 LIBERO**：镜像只含训练 / 推理依赖。做 LIBERO 评测时，把 LIBERO 代码挂进容器
   （如 `-v /path/to/LIBERO:/opt/LIBERO`）并自行安装其运行依赖；镜像已带 EGL/OpenGL 系统库
   （`MUJOCO_GL=egl`），支持无显示器离屏渲染。

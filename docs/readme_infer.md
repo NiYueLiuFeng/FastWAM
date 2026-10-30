@@ -89,19 +89,35 @@ bash /mnt/sfs_turbo/h00672373/code/docker/run_container.sh
 - `--network=host` 已由脚本设置，所以宿主机直接访问 `127.0.0.1:8765`。
 
 
-容器内安装依赖
-```
-docker exec -u 0 f756f68a004f bash -c 'cat >> /etc/profile.d/proxy.sh <<EOF
+### 1.3 容器内补装 serving 依赖（只有旧镜像需要）
+
+按当前 `docker/Dockerfile` 构建的镜像**已经包含** `[serving]` 依赖
+（`fastapi` / `uvicorn[standard]` / `msgpack` / `websockets`），这一步可以跳过。
+
+2026-10-15 那版镜像早于 Dockerfile 加入 `[serving]`，容器里没有这些包，需要手工补装：
+
+```bash
+docker exec -u 0 <容器名> bash -c 'cat >> /etc/profile.d/proxy.sh <<EOF
 export https_proxy=http://127.0.0.1:17897
 export http_proxy=http://127.0.0.1:17897
 export no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 EOF'
 
-## 宿主机外直接安装
-docker exec -u 0 f756f68a004f bash -lc '
+## 宿主机外直接安装（必须装 extra，裸 uvicorn 不带 WebSocket 实现）
+docker exec -u 0 <容器名> bash -lc '
 export https_proxy=http://127.0.0.1:17897 http_proxy=http://127.0.0.1:17897 all_proxy=http://127.0.0.1:17897
-pip install uvicorn'
+cd /workspace/FastWAM && python -m pip install -e ".[serving]"'
 ```
+
+注意两点：
+
+- 用 `python -m pip` 而不是裸 `pip`，确保装进 `scripts/serve.py` 实际用的解释器
+  （镜像里是 `/opt/venv/bin/python`）。
+- **不要用 `pip install uvicorn`**：裸 `uvicorn` 不含 `websockets`，服务仍能起来，
+  但 `/v1/ws` 的协议升级请求会被当成普通 `GET` 处理并返回 404，客户端报
+  `websockets.exceptions.InvalidStatus: server rejected WebSocket connection: HTTP 404`，
+  服务端日志是 `No supported WebSocket library detected.`。手工装进去的包在容器重建后
+  也会丢，正式做法是按 `docker/Dockerfile` 重建镜像。
 
 ---
 
@@ -113,6 +129,9 @@ pip install uvicorn'
 cd /workspace/FastWAM
 
 python -c "import torch, fastwam; print(torch.__version__, torch.cuda.is_available()); print(fastwam.__file__)"
+
+# serving 依赖 + WebSocket 后端（旧镜像这里会 ImportError，见 1.3）
+python -c "import fastapi, uvicorn, msgpack, websockets; from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol as ws; print('serving ok', fastapi.__version__, uvicorn.__version__, websockets.__version__, ws.__name__)"
 ```
 
 应看到类似：
@@ -166,6 +185,12 @@ cd /workspace/FastWAM
 export TASK=autogen_mixed_charger_white
 export CKPT=/workspace/FastWAM/runs/autogen_mixed_charger_white/2026-10-23_11-40-22/checkpoints/weights/step_020000.pt
 export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_charger_white/2026-10-23_11-40-22/dataset_stats.json
+
+## ur5数据
+export TASK=autogen_mixed_ur5
+export CKPT=/workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-27_02-19-37/checkpoints/weights/step_030000.pt
+export DATASET_STATS=/workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-27_02-19-37/dataset_stats.json
+
 
 export GPU=0
 export PORT=8765
@@ -770,6 +795,7 @@ kill "$(cat /workspace/FastWAM/runs/serve_logs/charger_white.pid)"
 | `TIMEOUT` / `BUSY` | 单卡单 worker 串行；提高 `REQUEST_TIMEOUT_MS`，或减少并发/步数 |
 | 端口冲突 | `PORT=18765`，客户端 URL 同步改 |
 | `torch.compile` 太慢或失败 | `COMPILE=false` 启动，推理会慢一些但更稳 |
+| 客户端 `InvalidStatus: HTTP 404`，服务端 `No supported WebSocket library detected` | 镜像没装 serving 依赖（`pip install uvicorn` 不够）。容器内 `python -m pip install -e ".[serving]"` 后重启服务，或按 `docker/Dockerfile` 重建镜像 |
 
 ---
 

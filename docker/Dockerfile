@@ -116,7 +116,13 @@ WORKDIR /workspace/FastWAM
 #    LIBERO-only deps). Mount a LIBERO checkout at runtime if you need it.
 #
 #    The layer ends with a build-time sanity check: dependency graph
-#    consistent, key packages importable.
+#    consistent, key packages importable, and uvicorn actually able to speak
+#    WebSocket. That last one matters: uvicorn picks its WS backend at import
+#    time and, with no backend, degrades silently -- upgrade requests are
+#    handled as plain GETs, so /v1/ws answers 404 and clients die with
+#    InvalidStatus. A bare `pip install uvicorn` (no [standard] extra) is
+#    exactly that state; assert it here instead of debugging it at runtime.
+#    The `[serving]` extra covers fastapi/uvicorn[standard]/msgpack/websockets.
 # ---------------------------------------------------------------------------
 COPY . /workspace/FastWAM
 RUN sed -i \
@@ -127,7 +133,8 @@ RUN sed -i \
   && pip install --no-cache-dir --retries 10 -e '/workspace/FastWAM[serving]' \
   && pip check \
   && python -c "import torch, torchvision, fastwam, deepspeed, av, torchcodec; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
-  && python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok')"
+  && python -c "import fastapi, uvicorn, msgpack, websockets; import fastwam.serving; print('serving ok', 'fastapi', fastapi.__version__, 'uvicorn', uvicorn.__version__, 'websockets', websockets.__version__)" \
+  && python -c "from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol as ws; assert ws is not None, 'uvicorn has no WebSocket backend: /v1/ws would answer HTTP 404'; print('ws backend', ws.__name__)"
 
 # WebSocket inference service port (see docs/serving_ws_api_zh.md).
 EXPOSE 8765
