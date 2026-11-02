@@ -16,8 +16,8 @@ learning_rate: 1e-4
 num_epochs: 10
 max_steps: null
 log_every: 10
-save_every: 2000
-eval_every: 200
+save_every: 10000
+eval_every: 5000
 
 gradient_accumulation_steps: 1
 weight_decay: 1e-2

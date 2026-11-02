@@ -223,7 +223,7 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
 | `delta_action_dims` | `null`（不转换）；指定后由 processor 自动套 `RelativeActionTransform` |
 | 归一化 | `min/max` |
 | 文本缓存 | `./data/text_embeds_cache/autogen_<name>`，`context_len=128` |
-| 训练超参 | `batch_size=2`、`num_workers=4`、`num_epochs=1`、`lr=1e-4`、`save_every=100`、`keep_last_n=2` |
+| 训练超参 | `batch_size=2`、`num_workers=4`、`num_epochs=1`、`lr=1e-4`、`save_every=10000`、`keep_last_n=2` |
 | 模型 | `fastwam` |
 
 `--concat null` 且多相机时必须显式给 `--video-size`；`robotwin` 布局与相机顺序/尺寸强相关，
@@ -323,9 +323,9 @@ learning_rate: 0.0001
 num_epochs: 1
 max_steps: null
 log_every: 10
-save_every: 100
+save_every: 10000
 keep_last_n: 2
-eval_every: 50
+eval_every: 5000
 gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
 resume: null
@@ -729,7 +729,7 @@ episode 长度只用于校验采样窗口，不会被写进配置。
 | `num_epochs` | `1` | `:51` |
 | `gradient_accumulation_steps` | `1` | `:53` |
 | `learning_rate` | `1e-4` | `:54` |
-| `save_every` | `2000` | `:55` |
+| `save_every` | `10000` | `:55` |
 | `keep_last_n` | `2`（只保留最近 2 个 checkpoint） | `:57` |
 | `max_steps` | `None`（按 epoch 与样本数自动算，见 10.5） | `:59` |
 | `resize` | `224 × 224` | `Policy` 定义 `:429` |
@@ -856,9 +856,10 @@ batch 补回来（例如 `--batch-size 2 --grad-accum 8` ≡ `--batch-size 8 --g
 | `checkpoints/weights/step_XXXXXX.pt` | 推理用权重 | ≈ 12 GB |
 | `checkpoints/state/step_XXXXXX/` | DeepSpeed ZeRO-1 全量状态（每张卡一份 optim state + 模型状态） | ≈ 94 GB |
 
-也就是**每个 checkpoint 约 106 GB**，而默认 `save_every: 100`。
-以 28267 步、4 卡为例：283 次 × 106 GB ≈ **30 TB**，磁盘会先被打满，
-而且是在训练中途，表现为三类报错一起出现：
+也就是**每个 checkpoint 约 106 GB**，而默认 `save_every: 10000`。
+以 28267 步、4 卡为例：默认只存 2 次 ≈ **0.2 TB**；但若沿用早期 100 步的间隔，
+就是 283 次 × 106 GB ≈ **30 TB**，磁盘会先被打满，而且是在训练中途，
+表现为三类报错一起出现：
 
 ```text
 RuntimeError: [enforce fail at inline_container.cc:857] . PytorchStreamWriter failed writing file data/0: file write failed
@@ -872,8 +873,9 @@ checkpoint、日志 `tee`、DeepSpeed Triton autotune 缓存同时写失败，�
 
 控制方式：
 
-- `--save-every N`：拉长间隔。每次保存要写 ~106 GB，期间训练是停住的，
-  100 步（约 2 分钟）保存一次等于把训练时间翻倍，长任务建议 1000~2000。
+- `--save-every N`：拉长间隔。每次保存要写 ~106 GB，期间训练是停住的；
+  100 步（约 2 分钟）保存一次等于把训练时间翻倍，所以默认给到 10000 步。
+  想更密（比如靠 checkpoint 做消融对比）可以调小，但要先算一下总占用。
 - `--keep-last N`（Hydra 键 `keep_last_n`）：只保留最近 N 个 weights/state，
   每次保存后自动删更旧的；`0` = 全留。`configs/train.yaml` 默认 `2`。
 - `--resume` 需要保留被续训的那个 `state/step_XXXXXX`，所以 `keep_last_n` 至少 1。
@@ -892,3 +894,63 @@ ls weights/step_*.pt | sort | head -n -1 | xargs -r rm -f  # 留最新权重
 `train_custom.sh` 在启动前会往 `<repo>/runs` 试写一个 `WRITE_PROBE_MB`
 （默认 64 MiB）的探针文件，写失败立即退出并打印上面的清理提示，
 避免训练跑 40 分钟才在第一次保存时崩掉。
+
+## 12. 训练过程记录：日志与 TensorBoard
+
+指标有三个去向，互不依赖：
+
+| 去向 | 开关 | 内容 | 位置 |
+| --- | --- | --- | --- |
+| 文本日志 | 始终开启 | `[train]` / `[eval]` / `[ckpt]` 行 | 终端 + `<repo>/log/<月-日-时分>_<model>_<task>.log` |
+| TensorBoard | `tensorboard.enabled: true`（默认） | 全部标量曲线 | `<output_dir>/tensorboard/`，即 `runs/<task>/<run_id>/tensorboard/` |
+| wandb | `wandb.enabled: false`（默认） | 同上 | 远端 |
+
+三者写的是同一份 payload（`src/fastwam/trainer.py` 的 `_log_metrics`），
+所以曲线上的点和日志里的数字完全对应：
+
+- 训练：每 `log_every` 步（默认 10）写 `train/loss`、`train/loss_action`、
+  `train/loss_video`、`train/grad_norm`、`train/lr`、`performance/steps_per_sec`、
+  `performance/samples_per_sec`
+- 评测：每 `eval_every` 步（默认 5000）写 `eval/val_loss`、`eval/psnr_*`、
+  `eval/ssim_*`、`eval/action_l1`、`eval/action_l2`
+- 横轴统一是 `global_step`（优化器步数，与 checkpoint 的 `step_XXXXXX` 一致）
+
+### 12.1 开启与查看
+
+TensorBoard 默认就开着，前提是容器里装了 `tensorboard`：
+
+```bash
+pip install tensorboard==2.20.0     # 镜像里已加进 pyproject 依赖，旧镜像需手动装
+```
+
+没装不会中断训练，只在启动时打一条 warning 然后跳过 —— 监控不应该能弄崩一次训练。
+
+查看（训练跑着也能看，`flush_secs: 30` 落盘一次）：
+
+```bash
+# 看单个 run
+tensorboard --logdir runs/autogen_mixed_guodi_new/<run_id>/tensorboard --port 6006
+
+# 看同一任务的所有 run 做对比
+tensorboard --logdir runs/autogen_mixed_guodi_new --port 6006
+```
+
+容器内启动需要把端口映射出来，或直接跑在宿主机上（`event` 文件在 SFS Turbo 上，
+宿主机可见）。
+
+关闭 / 改路径：
+
+```bash
+--extra "tensorboard.enabled=false"
+--extra "tensorboard.log_dir=/mnt/sfs_turbo/h00672373/tb/guodi_new"
+```
+
+### 12.2 注意
+
+- 只有主进程写，不会 4 个卡各写一份。
+- 单步 loss 噪声很大（每步重新采样 timestep 和噪声），看趋势请用 TensorBoard
+  自带的 `Smoothing`（0.8~0.95），不要看相邻两点。
+- `eval_every`（5000）和 `save_every`（10000）不重合：只有 10000 的整数倍
+  同时有评测点和 checkpoint，5000/15000 的评测结果只能在曲线里看到。
+- 曲线本身不占空间（一次 run 全程约几 MB），但它在 `runs/` 下，和 checkpoint
+  一起被 SFS Turbo 配额算进去，清理 checkpoint 时别连带删掉整个 run 目录。

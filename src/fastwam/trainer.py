@@ -1,3 +1,4 @@
+import atexit
 import logging
 import json
 import inspect
@@ -58,6 +59,18 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+
+        # TensorBoard is on by default, but a missing `tensorboard` package only
+        # logs a warning: monitoring must never be able to kill a training run.
+        tb_cfg = cfg.get("tensorboard", None)
+        self.tensorboard_enabled = bool(tb_cfg.get("enabled", False)) if tb_cfg is not None else False
+        tb_log_dir = tb_cfg.get("log_dir", None) if tb_cfg is not None else None
+        self.tensorboard_log_dir = (
+            os.path.join(self.output_dir, "tensorboard")
+            if tb_log_dir in (None, "", "null")
+            else str(tb_log_dir)
+        )
+        self.tensorboard_flush_secs = int(tb_cfg.get("flush_secs", 30)) if tb_cfg is not None else 30
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -148,7 +161,9 @@ class Wan22Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
+        self.tb_writer = None
         self._init_wandb()
+        self._init_tensorboard()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -189,6 +204,54 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_tensorboard(self):
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as e:
+            logger.warning(
+                "TensorBoard logging is enabled but the `tensorboard` package is missing (%s). "
+                "Continuing without TensorBoard; run `pip install tensorboard` to enable it.",
+                e,
+            )
+            self.tensorboard_enabled = False
+            return
+        os.makedirs(self.tensorboard_log_dir, exist_ok=True)
+        self.tb_writer = SummaryWriter(
+            log_dir=self.tensorboard_log_dir, flush_secs=self.tensorboard_flush_secs
+        )
+        # The step loop returns early when max_steps is reached, so close the
+        # writer here rather than after the loop.
+        atexit.register(self._finish_tensorboard)
+        logger.info(
+            "TensorBoard logging to %s (view with: tensorboard --logdir %s)",
+            self.tensorboard_log_dir,
+            self.tensorboard_log_dir,
+        )
+
+    def _tb_log(self, payload: dict):
+        if self.tb_writer is None:
+            return
+        for key, value in payload.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.tb_writer.add_scalar(str(key), float(value), self.global_step)
+
+    def _log_metrics(self, payload: dict):
+        """Fan a scalar payload out to every enabled logger."""
+        self._wandb_log(payload)
+        self._tb_log(payload)
+
+    def _finish_tensorboard(self):
+        writer, self.tb_writer = self.tb_writer, None
+        if writer is None:
+            return
+        try:
+            writer.flush()
+            writer.close()
+        except Exception:
+            pass
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -789,7 +852,7 @@ class Wan22Trainer:
                         )
                         logger.info(description)
 
-                        wandb_payload = {
+                        train_payload = {
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
@@ -797,8 +860,8 @@ class Wan22Trainer:
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
                         for key, value in global_loss_metrics.items():
-                            wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                            train_payload[f"train/{key}"] = value
+                        self._log_metrics(train_payload)
 
                     if (
                         self.eval_every > 0
@@ -832,7 +895,7 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            self._log_metrics(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()

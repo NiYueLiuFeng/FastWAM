@@ -82,7 +82,7 @@ optimizer state 约 94 GB），而 `runs/` 默认落在镜像挂进来的盘上�
 ```bash
 # 每 2000 步存一次、只留最近 2 个；总步数按 epoch 自动算
 bash scripts/train_zero1.sh 4 task=libero_uncond_2cam224_1e-4 \
-  save_every=2000 keep_last_n=2
+  save_every=10000 keep_last_n=2
 
 # 需要限定总步数时（默认 null = 自动算）
 bash scripts/train_zero1.sh 4 task=libero_uncond_2cam224_1e-4 \

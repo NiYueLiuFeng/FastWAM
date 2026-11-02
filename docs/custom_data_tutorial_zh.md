@@ -86,7 +86,7 @@ bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
 
 # 长任务：拉长保存间隔 + 只留最近 2 个 checkpoint
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
-  --save-every 2000 --keep-last 2
+  --save-every 10000 --keep-last 2
 
 # 追加/覆盖任意 Hydra 参数
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
@@ -112,13 +112,13 @@ max_steps = ceil(样本数 / (batch_size × GPU 数 × gradient_accumulation_ste
 #### checkpoint 占用与磁盘清理
 
 一个 checkpoint ≈ **106 GB**（12 GB 权重 + ~94 GB DeepSpeed ZeRO-1 状态），
-默认 `save_every: 100`。长任务请用 `--save-every N` 拉长间隔，并靠
+默认 `save_every: 10000`；想更密或更疏可以用 `--save-every N` 覆盖，并靠
 `keep_last_n`（默认 2）自动只留最近几个：
 
 ```bash
 # 等价写法：--keep-last N 或 --extra "keep_last_n=N"；0 = 全部保留
 bash scripts/train_custom.sh --dataset ./data/my_ds --gpus 8 \
-  --save-every 2000 --keep-last 2
+  --save-every 10000 --keep-last 2
 ```
 
 配额打满时会同时报 `Disk quota exceeded`（errno 122）、`tee: ...: Disk quota exceeded`，
@@ -410,9 +410,9 @@ learning_rate: 1e-4
 num_epochs: 10                         # ← 按数据规模调整
 max_steps: null
 log_every: 10
-save_every: 2000                      # 每个 checkpoint ≈ 106 GB，别设太密
+save_every: 10000                      # 每个 checkpoint ≈ 106 GB，别设太密
 keep_last_n: 2                        # 只保留最近 2 个（configs/train.yaml 默认也是 2）
-eval_every: 200
+eval_every: 5000
 
 # training
 gradient_accumulation_steps: 1
@@ -500,7 +500,7 @@ runs/mydata_uncond_2cam224_1e-4/{run_id}/
 
 ```bash
 bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4 \
-  save_every=2000 keep_last_n=2      # 每 2000 步存一次，只留最近 2 个
+  save_every=10000 keep_last_n=2      # 每 10000 步存一次，只留最近 2 个
 # 固定总步数：max_steps=20000（null = 按 num_epochs 自动算）
 # 不清理旧 checkpoint：keep_last_n=0
 ```
@@ -617,7 +617,7 @@ python scripts/precompute_text_embeds.py task=mydata_uncond_2cam224_1e-4
 # 3) 首次训练（自动生成 dataset_stats.json）
 #    save_every/keep_last_n 控制 checkpoint 数量：每个约 106 GB，长任务务必设置
 bash scripts/train_zero1.sh 8 task=mydata_uncond_2cam224_1e-4 \
-  save_every=2000 keep_last_n=2
+  save_every=10000 keep_last_n=2
 
 # 4) 推理（自定义环境按第 7.2 节；仿真按第 7.1 节）
 python examples/infer_custom.py \
@@ -819,7 +819,7 @@ bash scripts/train_custom.sh \
     --dry-run
 
 # 正式训练：与 dry-run 参数完全一致，去掉 --dry-run
-# 长任务再按需加：--save-every 2000 --keep-last 2 --max-steps 20000
+# 长任务再按需加：--save-every 10000 --keep-last 2 --max-steps 20000
 ```
 
 > `train_custom.sh` 每次都会按 `--dataset / --camera / --action-feature` 重新生成

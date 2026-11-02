@@ -227,12 +227,12 @@ bash scripts/train_custom.sh ... --gpus 4 --batch-size 2 --grad-accum 4   # 有�
 #### checkpoint / 磁盘配额（报 Errno 122）
 
 每个 checkpoint ≈ 106 GB（weights 12 GB + ZeRO-1 state 94 GB）。
-`configs/train.yaml` 默认 `save_every: 100` + `keep_last_n: 2`，盘占用有上限，
+`configs/train.yaml` 默认 `save_every: 10000` + `keep_last_n: 2`，盘占用有上限，
 但存得太密会反复卡住训练，长任务仍建议拉长间隔：
 
 ```bash
 # 拉长保存间隔 + 只保留最近 2 个（configs/train.yaml 默认 keep_last_n: 2）
-bash scripts/train_custom.sh ... --save-every 2000 --keep-last 2
+bash scripts/train_custom.sh ... --save-every 10000 --keep-last 2
 
 # 固定总步数（默认 null = 按 epochs × 样本数/(batch×卡数) 自动算，0 = 恢复自动）
 bash scripts/train_custom.sh ... --max-steps 20000
@@ -425,6 +425,21 @@ python scripts/prepare_custom_training.py \
     --print-name 
 
 
+### 国地不同本体
+python scripts/prepare_custom_training.py \
+    --dataset /workspace/data/guodi_new/guodi_cup_hang_20261027_v1 \
+    --dataset /workspace/data/guodi_new/guodi_cup_hang_20261029_v1 \
+    --dataset /workspace/data/guodi_new/guodi_rice_scoop_20261027_v1 \
+    --dataset /workspace/data/guodi_new/guodi_rice_scoop_20261028_v1 \
+    --dataset /workspace/data/guodi_new/guodi_rice_scoop_20261029_v1 \
+    --dataset /workspace/data/guodi_new/guodi_table_sweep_20261028_v1 \
+    --camera  head  --camera left_wrist --camera right_wrist \
+    --state-feature observation.state \
+    --action-feature action \
+    --name mixed_guodi-new \
+    --print-name 
+
+
 
 # 4) 预计算文本嵌入（覆盖所有数据集的任务文本，合并去重）
 python scripts/precompute_text_embeds.py task=autogen_mixed_ab
@@ -440,6 +455,8 @@ python scripts/precompute_text_embeds.py task=autogen_mixed_ur5
 python scripts/precompute_text_embeds.py  task=autogen_mixed_xingsong_resort_join_gripper 
 
 python scripts/precompute_text_embeds.py    task=autogen_mixed_lerobot_v30_flexiv_hz_union_v1 
+
+python scripts/precompute_text_embeds.py    task=autogen_mixed_guodi_new
 
 # 5) dry-run
 BACKBONE=/workspace/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
@@ -506,14 +523,14 @@ bash scripts/train_custom.sh \
 
 ### ur5e
 BACKBONE=/workspace/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
-bash scripts/train_custom.sh \
+NCCL_NVLS_ENABLE=0  bash scripts/train_custom.sh \
     --task autogen_mixed_ur5 \
     --action-feature action \
-    --max-steps  40000 \
+    --max-steps  70000 \
     --batch-size 4 \
     --grad-accum 2 \
     --gpus 4  \
-    --resume  /workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-26_02-21-10/checkpoints/state/step_020000  \
+    --resume  /workspace/FastWAM/runs/autogen_mixed_ur5/2026-10-27_02-19-37/checkpoints/state/step_040000  \
     --backbone "$BACKBONE" --dry-run
 
 
@@ -542,6 +559,16 @@ bash scripts/train_custom.sh \
     --backbone "$BACKBONE" --dry-run
 
 
+## 国地新数据
+BACKBONE=/workspace/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+NCCL_NVLS_ENABLE=0  bash scripts/train_custom.sh \
+    --task autogen_mixed_guodi_new \
+    --max-steps  70000 \
+    --keep-last 2  \
+    --batch-size 4 \
+    --grad-accum 2 \
+    --gpus 4  \
+    --backbone "$BACKBONE" --dry-run
 ```
 
 ### 训练脚本-delta action
@@ -565,7 +592,7 @@ bash scripts/train_custom.sh \
     --task autogen_mixed_flexiv_charger_white \
     --action-feature actions --camera front --camera wrist \
     --gpus 4 --backbone "$BACKBONE" \
-    --save-every 2000 --keep-last 2 \
+    --save-every 10000 --keep-last 2 \
     --resume /workspace/FastWAM/runs/autogen_mixed_flexiv_charger_white/2026-10-23_04-04-09/checkpoints/state/step_001800
 
 

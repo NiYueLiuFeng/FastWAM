@@ -52,7 +52,7 @@ DEFAULT_EPOCHS = 1
 # 有效 batch = batch_size × 卡数 × gradient_accumulation_steps
 DEFAULT_GRAD_ACCUM = 1
 DEFAULT_LR = 1e-4
-DEFAULT_SAVE_EVERY = 3000
+DEFAULT_SAVE_EVERY = 10000
 # 每个 checkpoint 约 106 GB（12 GB 权重 + ~94 GB ZeRO-1 状态），默认只留最近 2 个。
 DEFAULT_KEEP_LAST_N = 4
 # None = 按 num_epochs 和样本数自动算总步数（见 fastwam/trainer.py:_estimate_total_train_steps）。
