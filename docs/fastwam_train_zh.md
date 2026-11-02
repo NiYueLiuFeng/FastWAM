@@ -917,7 +917,8 @@ ls weights/step_*.pt | sort | head -n -1 | xargs -r rm -f  # 留最新权重
 
 ### 12.1 开启与查看
 
-TensorBoard 默认就开着，前提是容器里装了 `tensorboard`：
+TensorBoard **默认就开着**：即使某个配置里完全没写 `tensorboard:` 段，trainer 也按
+`enabled: true` 处理。唯一的前提是容器里装了 `tensorboard`：
 
 ```bash
 pip install tensorboard==2.20.0     # 镜像里已加进 pyproject 依赖，旧镜像需手动装

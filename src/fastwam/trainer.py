@@ -60,10 +60,11 @@ class Wan22Trainer:
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
-        # TensorBoard is on by default, but a missing `tensorboard` package only
-        # logs a warning: monitoring must never be able to kill a training run.
+        # Default-on: a run only costs a few MB of event files, and a missing
+        # `tensorboard` package degrades to a warning in _init_tensorboard —
+        # monitoring must never be able to kill a training run.
         tb_cfg = cfg.get("tensorboard", None)
-        self.tensorboard_enabled = bool(tb_cfg.get("enabled", False)) if tb_cfg is not None else False
+        self.tensorboard_enabled = True if tb_cfg is None else bool(tb_cfg.get("enabled", True))
         tb_log_dir = tb_cfg.get("log_dir", None) if tb_cfg is not None else None
         self.tensorboard_log_dir = (
             os.path.join(self.output_dir, "tensorboard")

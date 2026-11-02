@@ -107,6 +107,10 @@ EOF'
 docker exec -u 0 <容器名> bash -lc '
 export https_proxy=http://127.0.0.1:17897 http_proxy=http://127.0.0.1:17897 all_proxy=http://127.0.0.1:17897
 cd /workspace/FastWAM && python -m pip install -e ".[serving]"'
+
+sudo docker exec -u 0  0d562a325b9a   bash -lc '
+export https_proxy=http://127.0.0.1:17897 http_proxy=http://127.0.0.1:17897 all_proxy=http://127.0.0.1:17897
+cd /workspace/FastWAM && python -m pip install -e ".[serving]"'
 ```
 
 注意两点：
